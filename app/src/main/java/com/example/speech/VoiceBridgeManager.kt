@@ -24,7 +24,7 @@ enum class ListeningChannel {
 
 /**
  * Immutable snapshot of the active session and direction captured at the moment
- * speech recording starts. Guarantees that switching sessions or languages in the UI
+ * speech recording starts. Guarantees that switching sessions, languages, or speakers
  * while speaking or finalizing recognition never misroutes or mistranslates the utterance.
  */
 data class RecordingSessionContext(
@@ -60,14 +60,31 @@ class VoiceBridgeManager(
     (recordingContext: RecordingSessionContext, recognizedText: String) -> Unit,
   private val customSpeakHandler: ((text: String, languageTag: String) -> Unit)? = null,
 ) {
-  private var speechRecognizer: SpeechRecognizer? = null
+  /**
+   * Self-contained state for a single speech recognition turn.
+   * Isolating each turn's [context], [recognizer], [partialTranscript], and [isFinalizing]
+   * guarantees that starting a new turn (e.g. local engineer immediately pressing the second
+   * mic button after foreign engineer finishes speaking) never cancels the previous turn,
+   * never overwrites its session/direction context, and never destroys the new recognizer
+   * when the previous turn's delayed `onResults` arrives.
+   */
+  private class RecognitionAttempt(
+    val id: Long,
+    val context: RecordingSessionContext,
+    var recognizer: SpeechRecognizer? = null,
+    var listener: RecognitionListener? = null,
+    var partialTranscript: String = "",
+    var isFinalizing: Boolean = false,
+    var isCompleted: Boolean = false,
+  )
+
+  private var nextAttemptId = 1L
+  private var currentAttempt: RecognitionAttempt? = null
+  private val pendingFinalizingAttempts = ArrayDeque<RecognitionAttempt>()
   private var tts: TextToSpeech? = null
-  private var activeRecognitionListener: RecognitionListener? = null
 
   private val _state = MutableStateFlow(VoiceBridgeState())
   val state: StateFlow<VoiceBridgeState> = _state.asStateFlow()
-
-  private var activeRecordingContext: RecordingSessionContext? = null
 
   init {
     initTextToSpeech()
@@ -105,16 +122,27 @@ class VoiceBridgeManager(
   }
 
   /**
-   * Starts speech recognition and immediately pins the target [session] and [channel]
-   * so any subsequent UI session switch before `onResults` arrives will not affect
-   * where or how this utterance is recorded and translated.
+   * Starts speech recognition and immediately pins the target [session] and [channel].
+   * If a previous turn is still active or waiting for final `onResults`, it is gracefully
+   * finalized (`stopListening()`) and moved to [pendingFinalizingAttempts] instead of
+   * being cancelled—preserving natural back-and-forth turn-taking between speakers.
    */
   fun startListening(
     channel: ListeningChannel,
     session: TestSession,
     forceEnableInTest: Boolean = false,
   ) {
-    cancelListening()
+    // Gracefully finalize (do NOT cancel!) any in-progress previous turn so its final
+    // speech result can still be delivered without dropping the previous speaker's words.
+    val previousAttempt = currentAttempt
+    if (previousAttempt != null && !previousAttempt.isCompleted) {
+      finishAttemptInternal(previousAttempt)
+      if (!pendingFinalizingAttempts.contains(previousAttempt)) {
+        pendingFinalizingAttempts.addLast(previousAttempt)
+      }
+      currentAttempt = null
+    }
+
     stopSpeaking()
 
     val languageTag =
@@ -141,7 +169,12 @@ class VoiceBridgeManager(
         channel = channel,
         languageTag = languageTag,
       )
-    activeRecordingContext = pinnedContext
+    val attempt =
+      RecognitionAttempt(
+        id = nextAttemptId++,
+        context = pinnedContext,
+      )
+    currentAttempt = attempt
 
     _state.value =
       _state.value.copy(
@@ -154,12 +187,12 @@ class VoiceBridgeManager(
       )
 
     try {
-      val listener = createRecognitionListener(pinnedContext)
-      activeRecognitionListener = listener
+      val listener = createRecognitionListener(attempt)
+      attempt.listener = listener
 
       if (!forceEnableInTest) {
         val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
-        speechRecognizer = recognizer
+        attempt.recognizer = recognizer
         recognizer.setRecognitionListener(listener)
 
         val intent =
@@ -176,58 +209,136 @@ class VoiceBridgeManager(
       }
     } catch (e: Exception) {
       Log.e(TAG, "Failed to start SpeechRecognizer", e)
-      activeRecordingContext = null
-      activeRecognitionListener = null
-      _state.value =
-        _state.value.copy(
-          activeChannel = ListeningChannel.NONE,
-          isFinalizingSpeech = false,
-          pinnedSessionId = null,
-          statusHint = "無法啟動語音收音，請使用下方捷運現場語句快選或文字輸入。",
-        )
+      attempt.isCompleted = true
+      destroyAttemptRecognizer(attempt)
+      if (currentAttempt === attempt) {
+        currentAttempt = null
+        _state.value =
+          _state.value.copy(
+            activeChannel = ListeningChannel.NONE,
+            isFinalizingSpeech = false,
+            pinnedSessionId = null,
+            statusHint = "無法啟動語音收音，請使用下方捷運現場語句快選或文字輸入。",
+          )
+      }
     }
   }
 
-  private fun createRecognitionListener(pinnedContext: RecordingSessionContext): RecognitionListener {
+  private fun createRecognitionListener(attempt: RecognitionAttempt): RecognitionListener {
     return object : RecognitionListener {
       override fun onReadyForSpeech(params: Bundle?) {
-        _state.value = _state.value.copy(statusHint = "請開始說話，系統正在即時收音...")
+        if (currentAttempt === attempt && !attempt.isCompleted) {
+          _state.value = _state.value.copy(statusHint = "請開始說話，系統正在即時收音...")
+        }
       }
 
       override fun onBeginningOfSpeech() {}
 
       override fun onRmsChanged(rmsdB: Float) {
-        _state.value = _state.value.copy(rmsDbLevel = rmsdB.coerceIn(0f, 12f))
+        if (currentAttempt === attempt && !attempt.isCompleted) {
+          _state.value = _state.value.copy(rmsDbLevel = rmsdB.coerceIn(0f, 12f))
+        }
       }
 
       override fun onBufferReceived(buffer: ByteArray?) {}
 
       override fun onEndOfSpeech() {
-        _state.value =
-          _state.value.copy(
-            isFinalizingSpeech = true,
-            rmsDbLevel = 0f,
-            statusHint = "正在完成語音辨識...",
-          )
+        if (attempt.isCompleted) return
+        attempt.isFinalizing = true
+        if (currentAttempt === attempt) {
+          _state.value =
+            _state.value.copy(
+              isFinalizingSpeech = true,
+              rmsDbLevel = 0f,
+              statusHint = "正在完成語音辨識...",
+            )
+        }
       }
 
       override fun onError(error: Int) {
-        val currentContext = activeRecordingContext ?: pinnedContext
-        val fallbackPartial = _state.value.partialTranscript.trim()
-        val wasFinalizing = _state.value.isFinalizingSpeech
+        if (attempt.isCompleted) return
+        attempt.isCompleted = true
 
-        destroyRecognizerOnly()
-        activeRecordingContext = null
-        activeRecognitionListener = null
+        val attemptContext = attempt.context
+        val fallbackPartial = attempt.partialTranscript.trim()
+        val wasFinalizing = attempt.isFinalizing
 
-        // If the user already spoke partial text and tapped "完成收音" (or hit end-of-speech timeout),
-        // preserve and emit the partial transcript instead of dropping their utterance!
+        destroyAttemptRecognizer(attempt)
+        pendingFinalizingAttempts.remove(attempt)
+        val isStillCurrent = currentAttempt === attempt
+        if (isStillCurrent) {
+          currentAttempt = null
+        }
+
+        // If the speaker already produced partial text and finished speaking (or another mic was pressed),
+        // preserve and emit this attempt's partial transcript using its own pinned context!
         if (
           fallbackPartial.isNotBlank() &&
             (wasFinalizing ||
               error == SpeechRecognizer.ERROR_NO_MATCH ||
-              error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+              error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+              error == SpeechRecognizer.ERROR_CLIENT ||
+              error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY)
         ) {
+          if (isStillCurrent) {
+            _state.value =
+              _state.value.copy(
+                activeChannel = ListeningChannel.NONE,
+                isFinalizingSpeech = false,
+                pinnedSessionId = null,
+                partialTranscript = "",
+                rmsDbLevel = 0f,
+                statusHint = null,
+              )
+          }
+          onFinalSpeechResult(attemptContext, fallbackPartial)
+          return
+        }
+
+        if (isStillCurrent) {
+          val hint =
+            when (error) {
+              SpeechRecognizer.ERROR_NO_MATCH,
+              SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+                "未偵測到清晰語音。若在模擬器環境，可點擊下方「捷運現場情境語句」一鍵測試即時翻譯。"
+              SpeechRecognizer.ERROR_AUDIO ->
+                "麥克風音訊無法存取。您可使用下方「捷運現場情境語句」或文字輸入即時翻譯。"
+              SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+                "請允許麥克風權限以使用即時語音收音。"
+              else ->
+                "語音收音結束（代碼 $error），可直接點選下方現場語句或輸入文字。"
+            }
+          _state.value =
+            _state.value.copy(
+              activeChannel = ListeningChannel.NONE,
+              isFinalizingSpeech = false,
+              pinnedSessionId = null,
+              partialTranscript = "",
+              rmsDbLevel = 0f,
+              statusHint = hint,
+            )
+        }
+        Log.w(TAG, "SpeechRecognizer error=$error on channel=${attemptContext.channel}")
+      }
+
+      override fun onResults(results: Bundle?) {
+        if (attempt.isCompleted) return
+        attempt.isCompleted = true
+
+        // Strictly use THIS attempt's own immutable context and partialTranscript—never
+        // reading from a newer turn's currentAttempt!
+        val attemptContext = attempt.context
+        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+        val bestText =
+          matches?.firstOrNull()?.trim().orEmpty().ifBlank {
+            attempt.partialTranscript.trim()
+          }
+
+        destroyAttemptRecognizer(attempt)
+        pendingFinalizingAttempts.remove(attempt)
+        val isStillCurrent = currentAttempt === attempt
+        if (isStillCurrent) {
+          currentAttempt = null
           _state.value =
             _state.value.copy(
               activeChannel = ListeningChannel.NONE,
@@ -237,61 +348,15 @@ class VoiceBridgeManager(
               rmsDbLevel = 0f,
               statusHint = null,
             )
-          onFinalSpeechResult(currentContext, fallbackPartial)
-          return
         }
 
-        val hint =
-          when (error) {
-            SpeechRecognizer.ERROR_NO_MATCH,
-            SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
-              "未偵測到清晰語音。若在模擬器環境，可點擊下方「捷運現場情境語句」一鍵測試即時翻譯。"
-            SpeechRecognizer.ERROR_AUDIO ->
-              "麥克風音訊無法存取。您可使用下方「捷運現場情境語句」或文字輸入即時翻譯。"
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
-              "請允許麥克風權限以使用即時語音收音。"
-            else ->
-              "語音收音結束（代碼 $error），可直接點選下方現場語句或輸入文字。"
-          }
-        _state.value =
-          _state.value.copy(
-            activeChannel = ListeningChannel.NONE,
-            isFinalizingSpeech = false,
-            pinnedSessionId = null,
-            partialTranscript = "",
-            rmsDbLevel = 0f,
-            statusHint = hint,
-          )
-        Log.w(TAG, "SpeechRecognizer error=$error on channel=${currentContext.channel}")
-      }
-
-      override fun onResults(results: Bundle?) {
-        val currentContext = activeRecordingContext ?: pinnedContext
-        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-        val bestText =
-          matches?.firstOrNull()?.trim().orEmpty().ifBlank {
-            _state.value.partialTranscript.trim()
-          }
-
-        destroyRecognizerOnly()
-        activeRecordingContext = null
-        activeRecognitionListener = null
-
-        _state.value =
-          _state.value.copy(
-            activeChannel = ListeningChannel.NONE,
-            isFinalizingSpeech = false,
-            pinnedSessionId = null,
-            partialTranscript = "",
-            rmsDbLevel = 0f,
-            statusHint = null,
-          )
-        if (bestText.isNotBlank() && currentContext.channel != ListeningChannel.NONE) {
-          onFinalSpeechResult(currentContext, bestText)
+        if (bestText.isNotBlank() && attemptContext.channel != ListeningChannel.NONE) {
+          onFinalSpeechResult(attemptContext, bestText)
         }
       }
 
       override fun onPartialResults(partialResults: Bundle?) {
+        if (attempt.isCompleted) return
         val partial =
           partialResults
             ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -299,7 +364,10 @@ class VoiceBridgeManager(
             ?.trim()
             .orEmpty()
         if (partial.isNotBlank()) {
-          _state.value = _state.value.copy(partialTranscript = partial)
+          attempt.partialTranscript = partial
+          if (currentAttempt === attempt) {
+            _state.value = _state.value.copy(partialTranscript = partial)
+          }
         }
       }
 
@@ -307,34 +375,46 @@ class VoiceBridgeManager(
     }
   }
 
+  private fun finishAttemptInternal(attempt: RecognitionAttempt) {
+    if (attempt.isCompleted) return
+    attempt.isFinalizing = true
+    try {
+      attempt.recognizer?.stopListening()
+    } catch (e: Exception) {
+      Log.w(TAG, "stopListening failed for attempt ${attempt.id}", e)
+    }
+  }
+
   /**
    * Signals that the user has finished speaking (`SpeechRecognizer.stopListening()`)
-   * WITHOUT cancelling or destroying the recognizer or clearing `activeRecordingContext`,
-   * allowing Android's `SpeechRecognizer` to deliver `onResults` asynchronously.
+   * WITHOUT cancelling or destroying the recognizer, allowing Android's `SpeechRecognizer`
+   * to deliver `onResults` asynchronously.
    */
   fun finishListening() {
-    if (activeRecordingContext == null) return
+    val active = currentAttempt ?: return
+    if (active.isCompleted) return
     _state.value =
       _state.value.copy(
         isFinalizingSpeech = true,
         rmsDbLevel = 0f,
         statusHint = "正在辨識剛才講完的語音...",
       )
-    try {
-      speechRecognizer?.stopListening()
-    } catch (e: Exception) {
-      Log.w(TAG, "stopListening failed", e)
-    }
+    finishAttemptInternal(active)
   }
 
   /**
-   * Immediately aborts and discards the current speech recognition session without
-   * emitting a final result. Use when the user explicitly cancels recording or on teardown.
+   * Explicitly cancels and discards the currently active speech recognition turn without
+   * emitting a final result. Any earlier turn already in [pendingFinalizingAttempts] is
+   * left alone to finish delivering its result.
    */
   fun cancelListening() {
-    destroyRecognizerOnly()
-    activeRecordingContext = null
-    activeRecognitionListener = null
+    val active = currentAttempt
+    if (active != null) {
+      active.isCompleted = true
+      cancelAndDestroyAttemptRecognizer(active)
+      pendingFinalizingAttempts.remove(active)
+      currentAttempt = null
+    }
     _state.value =
       _state.value.copy(
         activeChannel = ListeningChannel.NONE,
@@ -345,24 +425,34 @@ class VoiceBridgeManager(
       )
   }
 
-  private fun destroyRecognizerOnly() {
+  private fun destroyAttemptRecognizer(attempt: RecognitionAttempt) {
     try {
-      speechRecognizer?.cancel()
-      speechRecognizer?.destroy()
+      attempt.recognizer?.destroy()
     } catch (_: Exception) {}
-    speechRecognizer = null
+    attempt.recognizer = null
+  }
+
+  private fun cancelAndDestroyAttemptRecognizer(attempt: RecognitionAttempt) {
+    try {
+      attempt.recognizer?.cancel()
+      attempt.recognizer?.destroy()
+    } catch (_: Exception) {}
+    attempt.recognizer = null
   }
 
   /**
-   * Test helper to simulate `SpeechRecognizer` partial and final results so Robolectric
-   * tests can verify `finishListening()` + delayed `onResults()` and session pinning.
+   * Test helper to simulate `SpeechRecognizer` final results in FIFO order across turns.
+   * If a previous turn was finalized when a second mic was pressed (`pendingFinalizingAttempts`),
+   * delivers the delayed `onResults` to that previous turn first; otherwise delivers to [currentAttempt].
    */
   internal fun deliverRecognitionResultsForTest(recognizedText: String) {
+    val targetAttempt =
+      pendingFinalizingAttempts.firstOrNull { !it.isCompleted } ?: currentAttempt
     val bundle =
       Bundle().apply {
         putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(recognizedText))
       }
-    activeRecognitionListener?.onResults(bundle)
+    targetAttempt?.listener?.onResults(bundle)
   }
 
   internal fun deliverPartialResultsForTest(partialText: String) {
@@ -370,7 +460,7 @@ class VoiceBridgeManager(
       Bundle().apply {
         putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION, arrayListOf(partialText))
       }
-    activeRecognitionListener?.onPartialResults(bundle)
+    currentAttempt?.listener?.onPartialResults(bundle)
   }
 
   fun speakText(text: String, languageTag: String) {
@@ -415,6 +505,12 @@ class VoiceBridgeManager(
 
   fun release() {
     cancelListening()
+    val pending = pendingFinalizingAttempts.toList()
+    pendingFinalizingAttempts.clear()
+    pending.forEach { attempt ->
+      attempt.isCompleted = true
+      cancelAndDestroyAttemptRecognizer(attempt)
+    }
     try {
       tts?.stop()
       tts?.shutdown()

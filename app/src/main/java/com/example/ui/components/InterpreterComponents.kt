@@ -76,6 +76,7 @@ import com.example.data.model.SUPPORTED_FOREIGN_LANGUAGES
 import com.example.data.model.TEST_CATEGORIES
 import com.example.data.model.Utterance
 import com.example.speech.ListeningChannel
+import com.example.viewmodel.canRetryTranslation
 import com.example.viewmodel.isTranslationFailed
 import com.example.viewmodel.isTranslationPending
 import java.text.SimpleDateFormat
@@ -533,6 +534,7 @@ fun DualChannelControlDeck(
 @Composable
 fun UtteranceBilingualCard(
   utterance: Utterance,
+  activeTranslatingIds: Set<String> = emptySet(),
   onSpeakText: (text: String, langTag: String) -> Unit,
   onTogglePin: (Utterance) -> Unit,
   onOpenSpotlight: (Utterance) -> Unit,
@@ -541,6 +543,7 @@ fun UtteranceBilingualCard(
   val isForeignSpeaker = utterance.speakerRole == "FOREIGN_ENGINEER"
   val isFailed = utterance.isTranslationFailed()
   val isPending = utterance.isTranslationPending()
+  val canRetry = utterance.canRetryTranslation(activeTranslatingIds)
 
   val accentColor =
     when {
@@ -648,7 +651,7 @@ fun UtteranceBilingualCard(
 
       Spacer(modifier = Modifier.height(6.dp))
 
-      // Primary Translated Text (or Retry Action when Translation Failed)
+      // Primary Translated Text (or Retry Action when Translation Failed or Interrupted)
       Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -666,7 +669,7 @@ fun UtteranceBilingualCard(
             },
           modifier = Modifier.weight(1f),
         )
-        if (isFailed) {
+        if (canRetry) {
           Spacer(modifier = Modifier.width(8.dp))
           OutlinedButton(
             onClick = { onRetryTranslation(utterance) },

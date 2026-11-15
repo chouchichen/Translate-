@@ -113,6 +113,7 @@ service cloud.firestore {
                          isValidId(userId) &&
                          isValidId(sessionId) &&
                          isValidId(utteranceId) &&
+                         exists(/databases/$(database)/documents/users/$(userId)/sessions/$(sessionId)) &&
                          incoming().keys().hasAll([
                            'userId', 'sessionId', 'speakerRole', 'speakerLabel',
                            'sourceLang', 'targetLang', 'originalText', 'translatedText',
@@ -131,6 +132,7 @@ service cloud.firestore {
                          isValidId(userId) &&
                          isValidId(sessionId) &&
                          isValidId(utteranceId) &&
+                         exists(/databases/$(database)/documents/users/$(userId)/sessions/$(sessionId)) &&
                          incoming().userId == existing().userId &&
                          incoming().sessionId == existing().sessionId &&
                          incoming().createdAt == existing().createdAt &&

@@ -116,6 +116,7 @@ fun MetroVoiceMainScreen(
   val aiTaskState by viewModel.aiTaskState.collectAsStateWithLifecycle()
   val autoSpeak by viewModel.autoSpeakTranslation.collectAsStateWithLifecycle()
   val spotlightUtterance by viewModel.spotlightUtterance.collectAsStateWithLifecycle()
+  val activeTranslatingIds by viewModel.activeTranslatingUtteranceIds.collectAsStateWithLifecycle()
 
   var activeTabIndex by remember { mutableIntStateOf(0) }
   var showCreateSessionDialog by remember { mutableStateOf(false) }
@@ -355,6 +356,7 @@ fun MetroVoiceMainScreen(
                   session = currentSession,
                   foreignLang = currentForeignLangOption,
                   utterances = utterances,
+                  activeTranslatingIds = activeTranslatingIds,
                   activeListeningChannel = voiceState.activeChannel,
                   isFinalizingSpeech = voiceState.isFinalizingSpeech,
                   partialSpeechText = voiceState.partialTranscript,
@@ -429,6 +431,7 @@ fun MetroVoiceMainScreen(
               session = currentSession,
               foreignLang = currentForeignLangOption,
               utterances = utterances,
+              activeTranslatingIds = activeTranslatingIds,
               activeListeningChannel = voiceState.activeChannel,
               isFinalizingSpeech = voiceState.isFinalizingSpeech,
               partialSpeechText = voiceState.partialTranscript,
@@ -688,6 +691,7 @@ private fun LiveInterpreterPane(
   session: TestSession,
   foreignLang: ForeignLanguageOption,
   utterances: List<Utterance>,
+  activeTranslatingIds: Set<String>,
   activeListeningChannel: ListeningChannel,
   isFinalizingSpeech: Boolean,
   partialSpeechText: String,
@@ -786,6 +790,7 @@ private fun LiveInterpreterPane(
       items(items = utterances.reversed(), key = { it.id }) { utterance ->
         UtteranceBilingualCard(
           utterance = utterance,
+          activeTranslatingIds = activeTranslatingIds,
           onSpeakText = onSpeakText,
           onTogglePin = onTogglePin,
           onOpenSpotlight = onOpenSpotlight,

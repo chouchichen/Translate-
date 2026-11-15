@@ -165,17 +165,38 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
   }
 
   /**
-   * Deletes all child documents in the `utterances` subcollection first so no orphaned
-   * transcripts remain in Firestore, and then deletes the parent `TestSession` document.
+   * Deletes the parent `TestSession` document first (which immediately blocks any concurrent
+   * device from adding new utterances under this session via Firestore security rules and
+   * atomic batch checks), and then repeatedly queries and batch-deletes the `utterances`
+   * subcollection in a loop until a fresh query confirms zero child documents remain.
    */
-  suspend fun deleteSession(userId: String, sessionId: String) {
+  suspend fun deleteSession(
+    userId: String,
+    sessionId: String,
+    onAfterFirstSubcollectionQueryForTest: (suspend () -> Unit)? = null,
+  ) {
     val sessionRef =
       db.collection("users").document(userId).collection("sessions").document(sessionId)
     val utterancesCollection = sessionRef.collection("utterances")
     try {
-      val utterancesSnapshot = utterancesCollection.get().await()
-      val docs = utterancesSnapshot.documents
-      if (docs.isNotEmpty()) {
+      // 1. Delete parent session first so any concurrent utterance creation is blocked immediately
+      sessionRef.delete().await()
+
+      // 2. Repeatedly drain the utterances subcollection until a query returns empty
+      var pass = 0
+      while (pass < 20) {
+        val utterancesSnapshot = utterancesCollection.get().await()
+        if (pass == 0 && onAfterFirstSubcollectionQueryForTest != null) {
+          onAfterFirstSubcollectionQueryForTest.invoke()
+        }
+        val docs = utterancesSnapshot.documents
+        if (docs.isEmpty()) {
+          if (pass == 0 && onAfterFirstSubcollectionQueryForTest != null) {
+            pass++
+            continue
+          }
+          break
+        }
         for (chunk in docs.chunked(450)) {
           val batch = db.batch()
           for (doc in chunk) {
@@ -183,8 +204,8 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
           }
           batch.commit().await()
         }
+        pass++
       }
-      sessionRef.delete().await()
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
@@ -254,20 +275,19 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
         "updatedAt" to FieldValue.serverTimestamp(),
       )
     try {
-      uttRef.set(payload).await()
       if (incrementSessionCount) {
-        try {
-          sessionRef
-            .update(
-              mapOf(
-                "utteranceCount" to FieldValue.increment(1L),
-                "updatedAt" to FieldValue.serverTimestamp(),
-              )
-            )
-            .await()
-        } catch (_: Exception) {
-          // Non-fatal if parent session document was not created in isolated unit test
-        }
+        val batch = db.batch()
+        batch.set(uttRef, payload)
+        batch.update(
+          sessionRef,
+          mapOf(
+            "utteranceCount" to FieldValue.increment(1L),
+            "updatedAt" to FieldValue.serverTimestamp(),
+          ),
+        )
+        batch.commit().await()
+      } else {
+        uttRef.set(payload).await()
       }
       return uttRef.id
     } catch (e: CancellationException) {

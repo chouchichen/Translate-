@@ -158,15 +158,20 @@ test("Shadow update test: rejects ghost fields on session update", async () => {
   );
 });
 
-test("Utterance subcollection: owner can create, list, and pin utterance; cross-user blocked", async () => {
+test("Utterance subcollection: owner can create, list, and pin utterance when session exists; blocked after session deleted or cross-user", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
-  const uttRef = aliceDb
+  const sessionRef = aliceDb
     .collection("users")
     .doc(ALICE_UID)
     .collection("sessions")
-    .doc(SESSION_ID)
-    .collection("utterances")
-    .doc(UTTERANCE_ID);
+    .doc(SESSION_ID);
+  const uttRef = sessionRef.collection("utterances").doc(UTTERANCE_ID);
+
+  // Cannot create utterance before parent session exists
+  await assertFails(uttRef.set(validUtterancePayload(ALICE_UID, SESSION_ID)));
+
+  // Create parent session first
+  await assertSucceeds(sessionRef.set(validSessionPayload(ALICE_UID)));
 
   await assertSucceeds(uttRef.set(validUtterancePayload(ALICE_UID, SESSION_ID)));
   await assertSucceeds(
@@ -194,5 +199,14 @@ test("Utterance subcollection: owner can create, list, and pin utterance; cross-
       .doc(SESSION_ID)
       .collection("utterances")
       .get()
+  );
+
+  // Deleting parent session blocks new utterances from being created under it
+  await assertSucceeds(sessionRef.delete());
+  await assertFails(
+    sessionRef
+      .collection("utterances")
+      .doc("utt_after_delete")
+      .set(validUtterancePayload(ALICE_UID, SESSION_ID))
   );
 });
