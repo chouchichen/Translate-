@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">MetroVoice</string>
+    <string name="sign_in_with_google">使用 Google 帳號登入啟動捷運口譯</string>
+    <string name="hero_banner_desc">MetroVoice 捷運測試控制中心橫幅插圖</string>
+    <string name="tab_live_interpreter">雙向即時口譯</string>
+    <string name="tab_meeting_minutes">即時會議紀錄</string>
+    <string name="tab_sessions_glossary">場次與術語庫</string>
+    <string name="foreign_channel_title">外籍技師講話 (即時翻中文)</string>
+    <string name="local_channel_title">我方講話 (反向翻外語＋朗讀)</string>
+    <string name="btn_generate_minutes">AI 即時產出／更新會議紀錄</string>
+    <string name="btn_new_session">新增測試場次</string>
+    <string name="btn_copy_minutes">複製會議紀錄</string>
+    <string name="btn_share_minutes">分享完整報告</string>
+    <string name="btn_read_minutes_aloud">語音朗讀摘要</string>
+    <string name="btn_sign_out">登出帳號</string>
+    <string name="spotlight_dialog_title">現場降噪大字卡 (給外籍技師看／聽)</string>
+    <string name="empty_utterances_hint">點擊上方「外籍技師講話」或「我方講話」按鈕開始雙向即時語音口譯，或點選下方捷運現場情境語句快速測試。</string>
+</resources>

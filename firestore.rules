@@ -1,0 +1,146 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isBoundedStringList(arr, maxLen, maxStrSize) {
+      return arr is list &&
+             arr.size() <= maxLen &&
+             (arr.size() == 0 || (arr[0] is string && arr[0].size() <= maxStrSize));
+    }
+
+    function isValidTestSession(data, pathUserId) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId == pathUserId &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+             data.metroLine is string && data.metroLine.size() >= 1 && data.metroLine.size() <= 100 &&
+             data.testCategory is string && data.testCategory.size() >= 1 && data.testCategory.size() <= 100 &&
+             data.foreignLangCode is string && data.foreignLangCode.size() >= 2 && data.foreignLangCode.size() <= 20 &&
+             data.foreignLangLabel is string && data.foreignLangLabel.size() >= 1 && data.foreignLangLabel.size() <= 60 &&
+             data.utteranceCount is int && data.utteranceCount >= 0 && data.utteranceCount <= 10000 &&
+             data.minutesSummary is string && data.minutesSummary.size() <= 5000 &&
+             isBoundedStringList(data.minutesKeyPoints, 30, 500) &&
+             isBoundedStringList(data.minutesActionItems, 30, 500) &&
+             data.minutesTestVerdict is string && data.minutesTestVerdict.size() >= 1 && data.minutesTestVerdict.size() <= 100 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidUtterance(data, pathUserId, pathSessionId) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.userId == pathUserId &&
+             data.sessionId is string &&
+             data.sessionId == pathSessionId &&
+             data.sessionId.size() >= 1 && data.sessionId.size() <= 128 &&
+             data.speakerRole is string &&
+             (data.speakerRole == 'FOREIGN_ENGINEER' || data.speakerRole == 'LOCAL_ENGINEER') &&
+             data.speakerLabel is string && data.speakerLabel.size() >= 1 && data.speakerLabel.size() <= 100 &&
+             data.sourceLang is string && data.sourceLang.size() >= 2 && data.sourceLang.size() <= 20 &&
+             data.targetLang is string && data.targetLang.size() >= 2 && data.targetLang.size() <= 20 &&
+             data.originalText is string && data.originalText.size() >= 1 && data.originalText.size() <= 2000 &&
+             data.translatedText is string && data.translatedText.size() >= 1 && data.translatedText.size() <= 2000 &&
+             isBoundedStringList(data.technicalTerms, 15, 200) &&
+             data.isPinnedToMinutes is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /users/{userId}/sessions/{sessionId} {
+      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(sessionId);
+      allow list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(userId) &&
+                       isValidId(sessionId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'title', 'metroLine', 'testCategory',
+                         'foreignLangCode', 'foreignLangLabel', 'utteranceCount',
+                         'minutesSummary', 'minutesKeyPoints', 'minutesActionItems',
+                         'minutesTestVerdict', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'title', 'metroLine', 'testCategory',
+                         'foreignLangCode', 'foreignLangLabel', 'utteranceCount',
+                         'minutesSummary', 'minutesKeyPoints', 'minutesActionItems',
+                         'minutesTestVerdict', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidTestSession(incoming(), userId);
+
+      allow update: if isSignedIn() &&
+                       isValidTestSession(incoming(), userId) &&
+                       request.auth.uid == userId &&
+                       isValidId(userId) &&
+                       isValidId(sessionId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'title', 'metroLine', 'testCategory',
+                         'foreignLangCode', 'foreignLangLabel', 'utteranceCount',
+                         'minutesSummary', 'minutesKeyPoints', 'minutesActionItems',
+                         'minutesTestVerdict', 'updatedAt'
+                       ]);
+
+      allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(sessionId);
+
+      match /utterances/{utteranceId} {
+        allow get: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(sessionId) && isValidId(utteranceId);
+        allow list: if isSignedIn() && request.auth.uid == userId;
+
+        allow create: if isSignedIn() &&
+                         request.auth.uid == userId &&
+                         isValidId(userId) &&
+                         isValidId(sessionId) &&
+                         isValidId(utteranceId) &&
+                         incoming().keys().hasAll([
+                           'userId', 'sessionId', 'speakerRole', 'speakerLabel',
+                           'sourceLang', 'targetLang', 'originalText', 'translatedText',
+                           'technicalTerms', 'isPinnedToMinutes', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'sessionId', 'speakerRole', 'speakerLabel',
+                           'sourceLang', 'targetLang', 'originalText', 'translatedText',
+                           'technicalTerms', 'isPinnedToMinutes', 'createdAt', 'updatedAt'
+                         ]) &&
+                         isValidUtterance(incoming(), userId, sessionId);
+
+        allow update: if isSignedIn() &&
+                         isValidUtterance(incoming(), userId, sessionId) &&
+                         request.auth.uid == userId &&
+                         isValidId(userId) &&
+                         isValidId(sessionId) &&
+                         isValidId(utteranceId) &&
+                         incoming().userId == existing().userId &&
+                         incoming().sessionId == existing().sessionId &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'originalText', 'translatedText', 'technicalTerms',
+                           'isPinnedToMinutes', 'updatedAt'
+                         ]);
+
+        allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(sessionId) && isValidId(utteranceId);
+      }
+    }
+  }
+}

@@ -1,0 +1,162 @@
+{
+  "entities": {
+    "TestSession": {
+      "title": "TestSession",
+      "description": "Represents an MRT rail testing and inspection session with real-time bilingual interpretation and generated meeting minutes.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated Firebase user UID of the session owner."
+        },
+        "title": {
+          "type": "string",
+          "description": "Title of the MRT testing session or meeting."
+        },
+        "metroLine": {
+          "type": "string",
+          "description": "Metro line or depot location where testing is conducted."
+        },
+        "testCategory": {
+          "type": "string",
+          "description": "Engineering test category (e.g. CBTC Signaling, Rolling Stock, PSD Sync)."
+        },
+        "foreignLangCode": {
+          "type": "string",
+          "description": "BCP-47 language code for the foreign engineer language (e.g. en-US, ja-JP, de-DE)."
+        },
+        "foreignLangLabel": {
+          "type": "string",
+          "description": "Display label for the foreign engineer language."
+        },
+        "utteranceCount": {
+          "type": "integer",
+          "description": "Total number of bilingual turns recorded in this session."
+        },
+        "minutesSummary": {
+          "type": "string",
+          "description": "AI-generated executive summary of the MRT testing meeting."
+        },
+        "minutesKeyPoints": {
+          "type": "array",
+          "description": "List of key technical observations and decisions from the session."
+        },
+        "minutesActionItems": {
+          "type": "array",
+          "description": "List of follow-up action items and responsible parties."
+        },
+        "minutesTestVerdict": {
+          "type": "string",
+          "description": "Current test status verdict (e.g. IN_PROGRESS, PASS, PENDING_RETEST, ISSUE_OPEN)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the session was created (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the session was last updated (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "metroLine",
+        "testCategory",
+        "foreignLangCode",
+        "foreignLangLabel",
+        "utteranceCount",
+        "minutesSummary",
+        "minutesKeyPoints",
+        "minutesActionItems",
+        "minutesTestVerdict",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Utterance": {
+      "title": "Utterance",
+      "description": "A single spoken turn in an MRT testing session with original speech text, bidirectional translation, and extracted rail terminology.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated Firebase user UID of the session owner."
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "Parent TestSession document ID."
+        },
+        "speakerRole": {
+          "type": "string",
+          "enum": ["FOREIGN_ENGINEER", "LOCAL_ENGINEER"],
+          "description": "Whether the speaker is the foreign vendor engineer or local MRT engineer."
+        },
+        "speakerLabel": {
+          "type": "string",
+          "description": "Display label for the speaker."
+        },
+        "sourceLang": {
+          "type": "string",
+          "description": "Source language code of the spoken utterance."
+        },
+        "targetLang": {
+          "type": "string",
+          "description": "Target language code of the translation."
+        },
+        "originalText": {
+          "type": "string",
+          "description": "Recognized speech transcript in the speaker's language."
+        },
+        "translatedText": {
+          "type": "string",
+          "description": "Real-time AI translation in the target language."
+        },
+        "technicalTerms": {
+          "type": "array",
+          "description": "Bilingual MRT/railway glossary terms detected in this utterance."
+        },
+        "isPinnedToMinutes": {
+          "type": "boolean",
+          "description": "Whether this utterance is starred for priority inclusion in meeting minutes."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the utterance was created (FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the utterance was last updated (FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "sessionId",
+        "speakerRole",
+        "speakerLabel",
+        "sourceLang",
+        "targetLang",
+        "originalText",
+        "translatedText",
+        "technicalTerms",
+        "isPinnedToMinutes",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/TestSession" },
+      "description": "User-scoped MRT testing sessions containing metadata and generated meeting minutes."
+    },
+    "/users/{userId}/sessions/{sessionId}/utterances/{utteranceId}": {
+      "schema": { "$ref": "#/entities/Utterance" },
+      "description": "Real-time bilingual interpretation utterances belonging to a specific MRT testing session."
+    }
+  }
+}

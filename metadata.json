@@ -1,0 +1,6 @@
+{
+  "name": "MetroVoice",
+  "description": "捷運測試雙向即時語音翻譯與會議紀錄助手 — 支援外語與中文雙向即時口譯、語音朗讀與一鍵產出專業捷運測試會議紀錄。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
