@@ -35,6 +35,7 @@ private const val TAG = "MetroVoiceVM"
 
 const val PENDING_TRANSLATION_PLACEHOLDER = "⏳ [口譯處理中...]"
 const val FAILED_TRANSLATION_PREFIX = "⚠️ [翻譯失敗，請點擊重試]"
+const val TRANSLATION_STALE_TIMEOUT_MS = 65_000L
 
 fun Utterance.isTranslationPending(): Boolean =
   translatedText.startsWith("⏳")
@@ -43,11 +44,19 @@ fun Utterance.isTranslationFailed(): Boolean =
   translatedText.startsWith("⚠️")
 
 /**
- * An utterance can be retried if it failed (`⚠️`) OR if it is stuck in pending (`⏳`)
- * while no active translation coroutine is currently processing it (e.g. after app termination).
+ * An utterance can be retried in the UI if it failed (`⚠️`) OR if it is stuck in pending (`⏳`)
+ * while no active translation coroutine on this device is currently processing it.
+ * Note: This is a pure read-only UI check that never mutates shared cloud records while
+ * another device may still be translating within the timeout window.
  */
 fun Utterance.canRetryTranslation(activeTranslatingIds: Set<String> = emptySet()): Boolean =
   isTranslationFailed() || (isTranslationPending() && id !in activeTranslatingIds)
+
+fun Utterance.isStalePendingTranslation(nowEpochMs: Long = System.currentTimeMillis()): Boolean {
+  if (!isTranslationPending()) return false
+  val timestampMs = (updatedAt ?: createdAt)?.toDate()?.time ?: return false
+  return (nowEpochMs - timestampMs) >= TRANSLATION_STALE_TIMEOUT_MS
+}
 
 sealed interface DataUiState<out T> {
   data object Loading : DataUiState<Nothing>
@@ -161,6 +170,16 @@ class MetroVoiceViewModel(
 
   private var hasSeededInitialSession = false
 
+  init {
+    viewModelScope.launch {
+      try {
+        repository.resumePendingSessionDeletions(currentUserId)
+      } catch (e: CancellationException) {
+        throw e
+      } catch (_: Exception) {}
+    }
+  }
+
   val sessionsState: StateFlow<DataUiState<List<TestSession>>> =
     repository
       .observeSessions(currentUserId)
@@ -203,15 +222,17 @@ class MetroVoiceViewModel(
           repository
             .observeUtterances(currentUserId, sessionId)
             .map<List<Utterance>, DataUiState<List<Utterance>>> { list ->
-              // Detect any utterance left in "⏳ [口譯處理中...]" from a previously terminated
-              // app session (not actively translating in this ViewModel) and mark it failed
-              // so it clearly displays as interrupted and retryable.
+              // Only auto-mark a "⏳ [口譯處理中...]" utterance as failed in Firestore if its
+              // timestamp has exceeded TRANSLATION_STALE_TIMEOUT_MS (65s > 60s model timeout).
+              // This ensures a second device (Phone B) viewing the same session never overwrites
+              // an utterance that Phone A is actively translating right now!
               if (inFlightCreationCount == 0) {
                 val activeIds = _activeTranslatingUtteranceIds.value
+                val nowMs = System.currentTimeMillis()
                 list.forEach { utt ->
                   if (
                     utt.id.isNotBlank() &&
-                      utt.isTranslationPending() &&
+                      utt.isStalePendingTranslation(nowMs) &&
                       utt.id !in activeIds &&
                       recoveringOrphanIds.add(utt.id)
                   ) {
@@ -219,7 +240,7 @@ class MetroVoiceViewModel(
                       markUtteranceTranslationFailed(
                         utt.sessionId,
                         utt.id,
-                        "上次口譯未完成，請點擊重試",
+                        "上次口譯逾時未完成，請點擊重試",
                       )
                     }
                   }

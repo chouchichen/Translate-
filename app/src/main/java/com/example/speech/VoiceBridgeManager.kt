@@ -41,6 +41,12 @@ data class RecordingSessionContext(
       }
 }
 
+data class QueuedSpeechItem(
+  val utteranceId: String,
+  val text: String,
+  val languageTag: String,
+)
+
 data class VoiceBridgeState(
   val activeChannel: ListeningChannel = ListeningChannel.NONE,
   val isFinalizingSpeech: Boolean = false,
@@ -49,39 +55,109 @@ data class VoiceBridgeState(
   val rmsDbLevel: Float = 0f,
   val isTtsSpeaking: Boolean = false,
   val isTtsReady: Boolean = false,
+  val currentSpeakingItem: QueuedSpeechItem? = null,
+  val pendingSpeechQueueSize: Int = 0,
+  val completedSpeechHistory: List<Pair<String, String>> = emptyList(),
   val lastSpokenText: String? = null,
   val lastSpokenLanguageTag: String? = null,
   val statusHint: String? = null,
 )
+
+/**
+ * Abstraction over Android's [SpeechRecognizer] so that both production and automated tests
+ * run through the exact same recognizer lifecycle (`startListening`, `stopListening`,
+ * queued turn handoff, and automatic `ERROR_RECOGNIZER_BUSY` retry).
+ */
+interface SpeechRecognizerEngine {
+  fun setRecognitionListener(listener: RecognitionListener)
+  fun startListening(recognizerIntent: Intent)
+  fun stopListening()
+  fun cancel()
+  fun destroy()
+}
+
+fun interface SpeechRecognizerEngineFactory {
+  fun create(context: Context): SpeechRecognizerEngine
+}
+
+private class AndroidSpeechRecognizerEngine(context: Context) : SpeechRecognizerEngine {
+  private val delegate: SpeechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+
+  override fun setRecognitionListener(listener: RecognitionListener) {
+    delegate.setRecognitionListener(listener)
+  }
+
+  override fun startListening(recognizerIntent: Intent) {
+    delegate.startListening(recognizerIntent)
+  }
+
+  override fun stopListening() {
+    delegate.stopListening()
+  }
+
+  override fun cancel() {
+    delegate.cancel()
+  }
+
+  override fun destroy() {
+    delegate.destroy()
+  }
+}
+
+/**
+ * Abstraction over Android's [TextToSpeech] engine to support utterance-driven FIFO
+ * queueing without `QUEUE_FLUSH` truncation and to verify full playback completion in tests.
+ */
+interface TtsDriver {
+  fun setProgressListener(
+    onStart: (utteranceId: String) -> Unit,
+    onDone: (utteranceId: String) -> Unit,
+    onError: (utteranceId: String) -> Unit,
+  )
+  fun setLanguage(locale: Locale): Int
+  fun setSpeechRate(rate: Float)
+  fun speak(text: String, queueMode: Int, utteranceId: String)
+  fun stop()
+  fun shutdown()
+}
 
 class VoiceBridgeManager(
   private val context: Context,
   private val onFinalSpeechResult:
     (recordingContext: RecordingSessionContext, recognizedText: String) -> Unit,
   private val customSpeakHandler: ((text: String, languageTag: String) -> Unit)? = null,
+  private val recognizerEngineFactory: SpeechRecognizerEngineFactory? = null,
+  private val customTtsDriver: TtsDriver? = null,
 ) {
   /**
    * Self-contained state for a single speech recognition turn.
-   * Isolating each turn's [context], [recognizer], [partialTranscript], and [isFinalizing]
-   * guarantees that starting a new turn (e.g. local engineer immediately pressing the second
-   * mic button after foreign engineer finishes speaking) never cancels the previous turn,
-   * never overwrites its session/direction context, and never destroys the new recognizer
-   * when the previous turn's delayed `onResults` arrives.
+   * - If a previous turn is still finalizing (`pendingFinalizingAttempts` is non-empty),
+   *   [isWaitingForPreviousTurn] defers starting the underlying hardware recognizer until
+   *   the previous turn's `onResults`/`onError` releases the speech service.
+   * - If the system speech service still reports `ERROR_RECOGNIZER_BUSY` on startup before
+   *   any partial speech has been captured, [busyRetryCount] automatically retries up to
+   *   [MAX_BUSY_RETRIES] times so the second speaker's turn is never dropped.
    */
   private class RecognitionAttempt(
     val id: Long,
     val context: RecordingSessionContext,
-    var recognizer: SpeechRecognizer? = null,
+    var recognizer: SpeechRecognizerEngine? = null,
     var listener: RecognitionListener? = null,
     var partialTranscript: String = "",
     var isFinalizing: Boolean = false,
+    var isWaitingForPreviousTurn: Boolean = false,
+    var busyRetryCount: Int = 0,
     var isCompleted: Boolean = false,
   )
 
   private var nextAttemptId = 1L
   private var currentAttempt: RecognitionAttempt? = null
   private val pendingFinalizingAttempts = ArrayDeque<RecognitionAttempt>()
-  private var tts: TextToSpeech? = null
+
+  private var ttsDriver: TtsDriver? = null
+  private val speechQueue = ArrayDeque<QueuedSpeechItem>()
+  private var activeSpeechItem: QueuedSpeechItem? = null
+  private val completedSpeechList = mutableListOf<Pair<String, String>>()
 
   private val _state = MutableStateFlow(VoiceBridgeState())
   val state: StateFlow<VoiceBridgeState> = _state.asStateFlow()
@@ -91,27 +167,70 @@ class VoiceBridgeManager(
   }
 
   private fun initTextToSpeech() {
+    if (customTtsDriver != null) {
+      ttsDriver = customTtsDriver
+      bindTtsProgressListener(customTtsDriver)
+      _state.value = _state.value.copy(isTtsReady = true)
+      return
+    }
     try {
-      tts =
-        TextToSpeech(context.applicationContext) { status ->
-          if (status == TextToSpeech.SUCCESS) {
-            tts?.setOnUtteranceProgressListener(
+      var androidTts: TextToSpeech? = null
+      val driver =
+        object : TtsDriver {
+          override fun setProgressListener(
+            onStart: (utteranceId: String) -> Unit,
+            onDone: (utteranceId: String) -> Unit,
+            onError: (utteranceId: String) -> Unit,
+          ) {
+            androidTts?.setOnUtteranceProgressListener(
               object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
-                  _state.value = _state.value.copy(isTtsSpeaking = true)
+                  if (utteranceId != null) onStart(utteranceId)
                 }
 
                 override fun onDone(utteranceId: String?) {
-                  _state.value = _state.value.copy(isTtsSpeaking = false)
+                  if (utteranceId != null) onDone(utteranceId)
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
-                  _state.value = _state.value.copy(isTtsSpeaking = false)
+                  if (utteranceId != null) onError(utteranceId)
                 }
               }
             )
+          }
+
+          override fun setLanguage(locale: Locale): Int =
+            androidTts?.setLanguage(locale) ?: TextToSpeech.ERROR
+
+          override fun setSpeechRate(rate: Float) {
+            androidTts?.setSpeechRate(rate)
+          }
+
+          override fun speak(text: String, queueMode: Int, utteranceId: String) {
+            androidTts?.speak(text, queueMode, null, utteranceId)
+          }
+
+          override fun stop() {
+            androidTts?.stop()
+          }
+
+          override fun shutdown() {
+            androidTts?.shutdown()
+          }
+        }
+
+      androidTts =
+        TextToSpeech(context.applicationContext) { status ->
+          if (status == TextToSpeech.SUCCESS) {
+            ttsDriver = driver
+            bindTtsProgressListener(driver)
             _state.value = _state.value.copy(isTtsReady = true)
+            // If items were queued before TTS finished initializing, start the first one now
+            if (activeSpeechItem == null && speechQueue.isNotEmpty()) {
+              val next = speechQueue.removeFirst()
+              dispatchSpeechItem(next)
+            }
           } else {
             Log.w(TAG, "TextToSpeech initialization returned status: $status")
           }
@@ -121,19 +240,58 @@ class VoiceBridgeManager(
     }
   }
 
+  private fun bindTtsProgressListener(driver: TtsDriver) {
+    driver.setProgressListener(
+      onStart = { utteranceId ->
+        if (activeSpeechItem?.utteranceId == utteranceId) {
+          _state.value = _state.value.copy(isTtsSpeaking = true)
+        }
+      },
+      onDone = { utteranceId -> handleTtsUtteranceFinished(utteranceId, completedSuccessfully = true) },
+      onError = { utteranceId ->
+        handleTtsUtteranceFinished(utteranceId, completedSuccessfully = false)
+      },
+    )
+  }
+
+  private fun handleTtsUtteranceFinished(
+    utteranceId: String,
+    completedSuccessfully: Boolean,
+  ) {
+    val current = activeSpeechItem
+    if (current != null && current.utteranceId == utteranceId) {
+      if (completedSuccessfully) {
+        completedSpeechList.add(current.text to current.languageTag)
+      }
+      val next = speechQueue.removeFirstOrNull()
+      if (next != null) {
+        dispatchSpeechItem(next)
+      } else {
+        activeSpeechItem = null
+        _state.value =
+          _state.value.copy(
+            isTtsSpeaking = false,
+            currentSpeakingItem = null,
+            pendingSpeechQueueSize = 0,
+            completedSpeechHistory = completedSpeechList.toList(),
+          )
+      }
+    }
+  }
+
   /**
    * Starts speech recognition and immediately pins the target [session] and [channel].
-   * If a previous turn is still active or waiting for final `onResults`, it is gracefully
-   * finalized (`stopListening()`) and moved to [pendingFinalizingAttempts] instead of
-   * being cancelled—preserving natural back-and-forth turn-taking between speakers.
+   * - If a previous turn is still active or waiting for final `onResults`, it is gracefully
+   *   finalized (`stopListening()`) and moved to [pendingFinalizingAttempts]—and starting the
+   *   new turn's hardware recognizer waits until the previous turn releases the speech service.
+   * - Does NOT flush or cut off ongoing TTS translations so the previous speaker's translated
+   *   audio finishes playing completely.
    */
   fun startListening(
     channel: ListeningChannel,
     session: TestSession,
     forceEnableInTest: Boolean = false,
   ) {
-    // Gracefully finalize (do NOT cancel!) any in-progress previous turn so its final
-    // speech result can still be delivered without dropping the previous speaker's words.
     val previousAttempt = currentAttempt
     if (previousAttempt != null && !previousAttempt.isCompleted) {
       finishAttemptInternal(previousAttempt)
@@ -143,8 +301,6 @@ class VoiceBridgeManager(
       currentAttempt = null
     }
 
-    stopSpeaking()
-
     val languageTag =
       if (channel == ListeningChannel.FOREIGN_TO_LOCAL) {
         session.foreignLangCode
@@ -152,7 +308,8 @@ class VoiceBridgeManager(
         "zh-TW"
       }
 
-    if (!forceEnableInTest && !SpeechRecognizer.isRecognitionAvailable(context)) {
+    val hasCustomFactory = recognizerEngineFactory != null
+    if (!forceEnableInTest && !hasCustomFactory && !SpeechRecognizer.isRecognitionAvailable(context)) {
       _state.value =
         _state.value.copy(
           activeChannel = ListeningChannel.NONE,
@@ -169,12 +326,17 @@ class VoiceBridgeManager(
         channel = channel,
         languageTag = languageTag,
       )
+    val shouldWaitForPrevious = pendingFinalizingAttempts.any { !it.isCompleted }
     val attempt =
       RecognitionAttempt(
         id = nextAttemptId++,
         context = pinnedContext,
+        isWaitingForPreviousTurn = shouldWaitForPrevious,
       )
     currentAttempt = attempt
+
+    val listener = createRecognitionListener(attempt, forceEnableInTest)
+    attempt.listener = listener
 
     _state.value =
       _state.value.copy(
@@ -183,32 +345,54 @@ class VoiceBridgeManager(
         pinnedSessionId = session.id,
         partialTranscript = "",
         rmsDbLevel = 0f,
-        statusHint = null,
+        statusHint =
+          if (shouldWaitForPrevious) {
+            "正在完成上一句收尾，隨即啟動收音..."
+          } else {
+            null
+          },
       )
 
+    if (!shouldWaitForPrevious) {
+      startRecognizerForAttempt(attempt, forceEnableInTest)
+    }
+  }
+
+  private fun startRecognizerForAttempt(
+    attempt: RecognitionAttempt,
+    forceEnableInTest: Boolean,
+  ) {
+    if (attempt.isCompleted) return
+    attempt.isWaitingForPreviousTurn = false
+    val listener = attempt.listener ?: createRecognitionListener(attempt, forceEnableInTest).also {
+      attempt.listener = it
+    }
+
     try {
-      val listener = createRecognitionListener(attempt)
-      attempt.listener = listener
+      val engine: SpeechRecognizerEngine? =
+        when {
+          recognizerEngineFactory != null -> recognizerEngineFactory.create(context)
+          !forceEnableInTest -> AndroidSpeechRecognizerEngine(context)
+          else -> null
+        }
 
-      if (!forceEnableInTest) {
-        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
-        attempt.recognizer = recognizer
-        recognizer.setRecognitionListener(listener)
-
+      attempt.recognizer = engine
+      if (engine != null) {
+        engine.setRecognitionListener(listener)
         val intent =
           Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(
               RecognizerIntent.EXTRA_LANGUAGE_MODEL,
               RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
             )
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, attempt.context.languageTag)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
           }
-        recognizer.startListening(intent)
+        engine.startListening(intent)
       }
     } catch (e: Exception) {
-      Log.e(TAG, "Failed to start SpeechRecognizer", e)
+      Log.e(TAG, "Failed to start SpeechRecognizerEngine", e)
       attempt.isCompleted = true
       destroyAttemptRecognizer(attempt)
       if (currentAttempt === attempt) {
@@ -224,7 +408,21 @@ class VoiceBridgeManager(
     }
   }
 
-  private fun createRecognitionListener(attempt: RecognitionAttempt): RecognitionListener {
+  private fun onPendingAttemptSettled(forceEnableInTest: Boolean) {
+    val active = currentAttempt ?: return
+    if (
+      !active.isCompleted &&
+        active.isWaitingForPreviousTurn &&
+        pendingFinalizingAttempts.none { !it.isCompleted }
+    ) {
+      startRecognizerForAttempt(active, forceEnableInTest)
+    }
+  }
+
+  private fun createRecognitionListener(
+    attempt: RecognitionAttempt,
+    forceEnableInTest: Boolean,
+  ): RecognitionListener {
     return object : RecognitionListener {
       override fun onReadyForSpeech(params: Bundle?) {
         if (currentAttempt === attempt && !attempt.isCompleted) {
@@ -257,11 +455,33 @@ class VoiceBridgeManager(
 
       override fun onError(error: Int) {
         if (attempt.isCompleted) return
-        attempt.isCompleted = true
 
-        val attemptContext = attempt.context
         val fallbackPartial = attempt.partialTranscript.trim()
         val wasFinalizing = attempt.isFinalizing
+
+        // Automatic recovery when the system speech service reports BUSY (or transient client
+        // handoff error) on rapid turn-taking before the second speaker has produced partial text!
+        if (
+          fallbackPartial.isBlank() &&
+            !wasFinalizing &&
+            (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+              error == SpeechRecognizer.ERROR_CLIENT) &&
+            attempt.busyRetryCount < MAX_BUSY_RETRIES
+        ) {
+          attempt.busyRetryCount++
+          destroyAttemptRecognizer(attempt)
+          if (currentAttempt === attempt) {
+            _state.value =
+              _state.value.copy(
+                statusHint = "語音服務切換中，正在自動重新接通收音 (${attempt.busyRetryCount}/$MAX_BUSY_RETRIES)..."
+              )
+          }
+          startRecognizerForAttempt(attempt, forceEnableInTest)
+          return
+        }
+
+        attempt.isCompleted = true
+        val attemptContext = attempt.context
 
         destroyAttemptRecognizer(attempt)
         pendingFinalizingAttempts.remove(attempt)
@@ -270,8 +490,10 @@ class VoiceBridgeManager(
           currentAttempt = null
         }
 
-        // If the speaker already produced partial text and finished speaking (or another mic was pressed),
-        // preserve and emit this attempt's partial transcript using its own pinned context!
+        // If a queued next turn was waiting for this finalizing turn to release the speech service,
+        // start that queued turn now!
+        onPendingAttemptSettled(forceEnableInTest)
+
         if (
           fallbackPartial.isNotBlank() &&
             (wasFinalizing ||
@@ -325,8 +547,6 @@ class VoiceBridgeManager(
         if (attempt.isCompleted) return
         attempt.isCompleted = true
 
-        // Strictly use THIS attempt's own immutable context and partialTranscript—never
-        // reading from a newer turn's currentAttempt!
         val attemptContext = attempt.context
         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
         val bestText =
@@ -349,6 +569,9 @@ class VoiceBridgeManager(
               statusHint = null,
             )
         }
+
+        // Start any next turn that was waiting for this attempt to finish!
+        onPendingAttemptSettled(forceEnableInTest)
 
         if (bestText.isNotBlank() && attemptContext.channel != ListeningChannel.NONE) {
           onFinalSpeechResult(attemptContext, bestText)
@@ -442,8 +665,6 @@ class VoiceBridgeManager(
 
   /**
    * Test helper to simulate `SpeechRecognizer` final results in FIFO order across turns.
-   * If a previous turn was finalized when a second mic was pressed (`pendingFinalizingAttempts`),
-   * delivers the delayed `onResults` to that previous turn first; otherwise delivers to [currentAttempt].
    */
   internal fun deliverRecognitionResultsForTest(recognizedText: String) {
     val targetAttempt =
@@ -463,40 +684,99 @@ class VoiceBridgeManager(
     currentAttempt?.listener?.onPartialResults(bundle)
   }
 
-  fun speakText(text: String, languageTag: String) {
-    if (text.isBlank()) return
+  /**
+   * Enqueues [text] in [languageTag] for sequential TTS playback.
+   * Never uses `QUEUE_FLUSH` by default so that back-to-back translated sentences play
+   * completely in FIFO order without cutting off the previous sentence mid-speech, and
+   * switches the TTS engine language right before each utterance begins playing.
+   */
+  fun speakText(
+    text: String,
+    languageTag: String,
+    interruptCurrent: Boolean = false,
+  ) {
+    val cleanText = text.trim()
+    if (cleanText.isEmpty()) return
+
+    if (interruptCurrent) {
+      speechQueue.clear()
+      activeSpeechItem = null
+      try {
+        ttsDriver?.stop()
+      } catch (_: Exception) {}
+    }
+
+    val item =
+      QueuedSpeechItem(
+        utteranceId = UUID.randomUUID().toString(),
+        text = cleanText,
+        languageTag = languageTag,
+      )
+
+    if (activeSpeechItem == null) {
+      dispatchSpeechItem(item)
+    } else {
+      speechQueue.addLast(item)
+      _state.value =
+        _state.value.copy(
+          pendingSpeechQueueSize = speechQueue.size,
+        )
+    }
+  }
+
+  private fun dispatchSpeechItem(item: QueuedSpeechItem) {
+    activeSpeechItem = item
     _state.value =
       _state.value.copy(
-        lastSpokenText = text,
-        lastSpokenLanguageTag = languageTag,
+        isTtsSpeaking = true,
+        currentSpeakingItem = item,
+        pendingSpeechQueueSize = speechQueue.size,
+        lastSpokenText = item.text,
+        lastSpokenLanguageTag = item.languageTag,
       )
-    if (customSpeakHandler != null) {
-      customSpeakHandler.invoke(text, languageTag)
+
+    if (customSpeakHandler != null && customTtsDriver == null) {
+      customSpeakHandler.invoke(item.text, item.languageTag)
+      handleTtsUtteranceFinished(item.utteranceId, completedSuccessfully = true)
       return
     }
-    val engine = tts ?: return
+
+    val driver = ttsDriver
+    if (driver == null) {
+      // Keep item as active/queued until TTS initialization callback dispatches it
+      return
+    }
+
     try {
-      val locale = Locale.forLanguageTag(languageTag)
-      val langResult = engine.setLanguage(locale)
+      val locale = Locale.forLanguageTag(item.languageTag)
+      val langResult = driver.setLanguage(locale)
       if (
         langResult == TextToSpeech.LANG_MISSING_DATA ||
           langResult == TextToSpeech.LANG_NOT_SUPPORTED
       ) {
-        Log.w(TAG, "TTS locale $languageTag not fully supported, using default fallback")
+        Log.w(TAG, "TTS locale ${item.languageTag} not fully supported, using default fallback")
       }
-      engine.setSpeechRate(0.98f)
-      val utteranceId = UUID.randomUUID().toString()
-      engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+      driver.setSpeechRate(0.98f)
+      customSpeakHandler?.invoke(item.text, item.languageTag)
+      driver.speak(item.text, TextToSpeech.QUEUE_ADD, item.utteranceId)
     } catch (e: Exception) {
       Log.e(TAG, "TTS speakText failed", e)
+      handleTtsUtteranceFinished(item.utteranceId, completedSuccessfully = false)
     }
   }
 
   fun stopSpeaking() {
+    speechQueue.clear()
+    activeSpeechItem = null
     try {
-      tts?.stop()
+      ttsDriver?.stop()
     } catch (_: Exception) {}
-    _state.value = _state.value.copy(isTtsSpeaking = false)
+    _state.value =
+      _state.value.copy(
+        isTtsSpeaking = false,
+        currentSpeakingItem = null,
+        pendingSpeechQueueSize = 0,
+      )
   }
 
   fun clearHint() {
@@ -511,14 +791,15 @@ class VoiceBridgeManager(
       attempt.isCompleted = true
       cancelAndDestroyAttemptRecognizer(attempt)
     }
+    stopSpeaking()
     try {
-      tts?.stop()
-      tts?.shutdown()
+      ttsDriver?.shutdown()
     } catch (_: Exception) {}
-    tts = null
+    ttsDriver = null
   }
 
   private companion object {
     const val TAG = "VoiceBridgeManager"
+    const val MAX_BUSY_RETRIES = 3
   }
 }

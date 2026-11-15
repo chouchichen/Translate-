@@ -12,6 +12,7 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.snapshots
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -20,14 +21,82 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 
-class MetroVoiceRepository(private val db: FirebaseFirestore) {
+/**
+ * Durable journal of session IDs whose deletion is in progress.
+ * Ensures that if the app process is terminated after the parent `TestSession` document
+ * is deleted from Firestore—but before all child `utterances` documents have been purged—
+ * the next app launch (`observeSessions` / `resumePendingSessionDeletions`) automatically
+ * resumes and finishes deleting the remaining child `utterances`.
+ */
+interface PendingDeleteSessionStore {
+  fun markPendingDelete(userId: String, sessionId: String)
+  fun clearPendingDelete(userId: String, sessionId: String)
+  fun getPendingDeleteSessionIds(userId: String): Set<String>
+}
+
+class SharedPrefsPendingDeleteSessionStore(context: Context) : PendingDeleteSessionStore {
+  private val prefs =
+    context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+  @Synchronized
+  override fun markPendingDelete(userId: String, sessionId: String) {
+    val current = prefs.getStringSet(keyForUser(userId), emptySet())?.toMutableSet() ?: mutableSetOf()
+    current.add(sessionId)
+    prefs.edit().putStringSet(keyForUser(userId), current).commit()
+  }
+
+  @Synchronized
+  override fun clearPendingDelete(userId: String, sessionId: String) {
+    val current = prefs.getStringSet(keyForUser(userId), emptySet())?.toMutableSet() ?: mutableSetOf()
+    if (current.remove(sessionId)) {
+      prefs.edit().putStringSet(keyForUser(userId), current).commit()
+    }
+  }
+
+  @Synchronized
+  override fun getPendingDeleteSessionIds(userId: String): Set<String> {
+    return prefs.getStringSet(keyForUser(userId), emptySet())?.toSet() ?: emptySet()
+  }
+
+  private fun keyForUser(userId: String): String = "pending_delete_sessions_$userId"
+
+  private companion object {
+    const val PREFS_NAME = "metro_voice_pending_deletes"
+  }
+}
+
+class InMemoryPendingDeleteSessionStore : PendingDeleteSessionStore {
+  private val map = ConcurrentHashMap<String, MutableSet<String>>()
+
+  @Synchronized
+  override fun markPendingDelete(userId: String, sessionId: String) {
+    map.getOrPut(userId) { mutableSetOf() }.add(sessionId)
+  }
+
+  @Synchronized
+  override fun clearPendingDelete(userId: String, sessionId: String) {
+    map[userId]?.remove(sessionId)
+  }
+
+  @Synchronized
+  override fun getPendingDeleteSessionIds(userId: String): Set<String> {
+    return map[userId]?.toSet() ?: emptySet()
+  }
+}
+
+class MetroVoiceRepository(
+  private val db: FirebaseFirestore,
+  private val pendingDeleteStore: PendingDeleteSessionStore = InMemoryPendingDeleteSessionStore(),
+) {
 
   constructor(
     context: Context
   ) : this(
-    FirebaseFirestore.getInstance(
-      context.applicationContext.getString(R.string.firestore_database_id)
-    )
+    db =
+      FirebaseFirestore.getInstance(
+        context.applicationContext.getString(R.string.firestore_database_id)
+      ),
+    pendingDeleteStore = SharedPrefsPendingDeleteSessionStore(context.applicationContext),
   )
 
   private val auth = Firebase.auth
@@ -37,7 +106,38 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
       ?: throw IllegalStateException("請先使用 Google 帳號登入後再存取雲端資料。")
   }
 
+  fun getPendingDeleteSessionIds(userId: String): Set<String> =
+    pendingDeleteStore.getPendingDeleteSessionIds(userId)
+
+  /**
+   * Resumes and completes any session deletions that were interrupted before their
+   * `utterances` subcollection finished being purged.
+   */
+  suspend fun resumePendingSessionDeletions(userId: String) {
+    val pendingSessionIds = pendingDeleteStore.getPendingDeleteSessionIds(userId)
+    if (pendingSessionIds.isEmpty()) return
+
+    for (sessionId in pendingSessionIds) {
+      try {
+        deleteSession(userId, sessionId)
+      } catch (e: CancellationException) {
+        throw e
+      } catch (_: Exception) {
+        // Keep in pendingDeleteStore so a subsequent retry can finish cleaning up
+      }
+    }
+  }
+
   fun observeSessions(userId: String): Flow<List<TestSession>> = flow {
+    // Automatically resume any interrupted session deletions on startup
+    try {
+      if (auth.currentUser?.uid == userId) {
+        resumePendingSessionDeletions(userId)
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (_: Exception) {}
+
     val path = "users/$userId/sessions"
     emitAll(
       db.collection("users")
@@ -45,8 +145,10 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
         .collection("sessions")
         .snapshots()
         .map { snapshot ->
+          val pendingDeletes = pendingDeleteStore.getPendingDeleteSessionIds(userId)
           snapshot
             .toObjects(TestSession::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            .filter { it.id !in pendingDeletes }
             .sortedByDescending { it.updatedAt ?: it.createdAt ?: Timestamp(0, 0) }
         }
         .catch { error ->
@@ -165,10 +267,13 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
   }
 
   /**
-   * Deletes the parent `TestSession` document first (which immediately blocks any concurrent
-   * device from adding new utterances under this session via Firestore security rules and
-   * atomic batch checks), and then repeatedly queries and batch-deletes the `utterances`
-   * subcollection in a loop until a fresh query confirms zero child documents remain.
+   * Crash-resilient session deletion:
+   * 1. Records [sessionId] in [pendingDeleteStore] BEFORE deleting the parent session document.
+   * 2. Deletes the parent `TestSession` document so Firestore security rules (`exists(...)`)
+   *    and atomic batch checks immediately block any other device from adding new utterances.
+   * 3. Repeatedly queries and batch-deletes the `utterances` subcollection in a loop until
+   *    a fresh query confirms zero child documents remain.
+   * 4. Clears [sessionId] from [pendingDeleteStore] ONLY after all child `utterances` are gone.
    */
   suspend fun deleteSession(
     userId: String,
@@ -179,10 +284,13 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
       db.collection("users").document(userId).collection("sessions").document(sessionId)
     val utterancesCollection = sessionRef.collection("utterances")
     try {
-      // 1. Delete parent session first so any concurrent utterance creation is blocked immediately
+      // 1. Persist pending delete intent to durable store before deleting parent session
+      pendingDeleteStore.markPendingDelete(userId, sessionId)
+
+      // 2. Delete parent session first so any concurrent utterance creation is blocked immediately
       sessionRef.delete().await()
 
-      // 2. Repeatedly drain the utterances subcollection until a query returns empty
+      // 3. Repeatedly drain the utterances subcollection until a query returns empty
       var pass = 0
       while (pass < 20) {
         val utterancesSnapshot = utterancesCollection.get().await()
@@ -206,6 +314,9 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
         }
         pass++
       }
+
+      // 4. Clear pending delete entry only after all child utterances have been deleted
+      pendingDeleteStore.clearPendingDelete(userId, sessionId)
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
