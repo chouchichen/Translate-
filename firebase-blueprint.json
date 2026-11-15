@@ -122,6 +122,10 @@
           "type": "boolean",
           "description": "Whether this utterance is starred for priority inclusion in meeting minutes."
         },
+        "translationAttemptId": {
+          "type": "string",
+          "description": "Unique token identifying the active or most recent translation/retry attempt for optimistic concurrency control across devices."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

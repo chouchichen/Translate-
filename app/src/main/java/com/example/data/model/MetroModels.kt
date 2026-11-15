@@ -39,6 +39,7 @@ data class Utterance(
   @get:PropertyName("isPinnedToMinutes")
   @set:PropertyName("isPinnedToMinutes")
   var isPinnedToMinutes: Boolean = false,
+  val translationAttemptId: String = "",
   @ServerTimestamp val createdAt: Timestamp? = null,
   @ServerTimestamp val updatedAt: Timestamp? = null,
 )

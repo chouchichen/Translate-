@@ -494,6 +494,7 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
         """{"translatedText": "【中譯】Beacon handover latency is 12 ms.", "technicalTerms": []}"""
       )
       withTimeout(FLOW_TIMEOUT_MS) {
+        viewModel.activeTranslatingUtteranceIds.first { it.isEmpty() }
         viewModel.aiTaskState.first { it is AiTaskState.Idle }
       }
 
@@ -918,18 +919,177 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
         reopenedViewModel.aiTaskState.first { it is AiTaskState.Idle }
       }
       assertEquals(listOf("程序重啟後成功補譯的中文譯文。" to "zh-TW"), spoken)
+
+      // Part D: Simultaneous Dual-Device Retry on the SAME Failed Utterance!
+      // Both Phone A and Phone B observe the exact same failed utterance ("⚠️ ...").
+      // Both press Retry at the same time (passing the failed snapshot they each saw).
+      // Verify:
+      // 1. Only ONE device wins claimUtteranceForRetryIfEligible (because the winner updates
+      //    translationAttemptId and translatedText -> ⏳, causing the second device's transaction
+      //    to see a version/attempt mismatch and return false).
+      // 2. Only ONE device invokes customTranslationGenerator (translationCallCount == 1).
+      // 3. Only ONE TTS playback occurs (dualRetrySpoken.size == 1).
+      // 4. Only ONE result is written back, and completeUtteranceTranslationIfAttemptMatches
+      //    rejects any stale attemptId!
+      val sharedFailedUtteranceId =
+        withTimeout(DEFAULT_TIMEOUT_MS) {
+          phoneARepository.addUtterance(
+            sessionId = validSessionId,
+            speakerRole = "FOREIGN_ENGINEER",
+            speakerLabel = "外籍技師",
+            sourceLang = "en-US",
+            targetLang = "zh-TW",
+            originalText = "Simultaneous dual-device retry test sentence.",
+            translatedText = "⚠️ [翻譯失敗，請點擊重試]（連線逾時）",
+            technicalTerms = emptyList(),
+            translationAttemptId = "attempt_failed_v1",
+          )
+        }
+
+      var dualRetryTranslationCalls = 0
+      val dualRetryGate = CompletableDeferred<String>()
+      val dualRetrySpoken = mutableListOf<Pair<String, String>>()
+
+      val retryVmA =
+        MetroVoiceViewModel(
+          repository = phoneARepository,
+          currentUserId = aliceUid,
+          autoSeedOnEmpty = false,
+          customTranslationGenerator = { _, _, _ ->
+            dualRetryTranslationCalls++
+            dualRetryGate.await()
+          },
+        )
+      val retryVmB =
+        MetroVoiceViewModel(
+          repository = phoneBRepository,
+          currentUserId = aliceUid,
+          autoSeedOnEmpty = false,
+          customTranslationGenerator = { _, _, _ ->
+            dualRetryTranslationCalls++
+            """{"translatedText": "第二台不應被呼叫的重複翻譯", "technicalTerms": []}"""
+          },
+        )
+      retryVmA.selectSession(validSessionId)
+      retryVmB.selectSession(validSessionId)
+
+      val failedSnapshotOnA =
+        withTimeout(FLOW_TIMEOUT_MS) {
+          retryVmA.utterancesState
+            .first { state ->
+              state is DataUiState.Success && state.data.any { it.id == sharedFailedUtteranceId }
+            }
+            .let { (it as DataUiState.Success).data.first { u -> u.id == sharedFailedUtteranceId } }
+        }
+      val failedSnapshotOnB =
+        withTimeout(FLOW_TIMEOUT_MS) {
+          retryVmB.utterancesState
+            .first { state ->
+              state is DataUiState.Success && state.data.any { it.id == sharedFailedUtteranceId }
+            }
+            .let { (it as DataUiState.Success).data.first { u -> u.id == sharedFailedUtteranceId } }
+        }
+      assertEquals("attempt_failed_v1", failedSnapshotOnA.translationAttemptId)
+      assertEquals("attempt_failed_v1", failedSnapshotOnB.translationAttemptId)
+
+      // Phone A presses Retry first -> claims the retry in Firestore (status becomes ⏳ with Phone A's newAttemptId)
+      retryVmA.retryTranslateUtterance(
+        session = validSession,
+        utterance = failedSnapshotOnA,
+        onSpeakTranslationReady = { text, lang -> dualRetrySpoken.add(text to lang) },
+      )
+
+      // Wait until Firestore reflects Phone A's claim (⏳ [口譯處理中...] and updated translationAttemptId)
+      val claimedInFirestore =
+        withTimeout(FLOW_TIMEOUT_MS) {
+          phoneARepository
+            .observeUtterances(aliceUid, validSessionId)
+            .first { list ->
+              list.any {
+                it.id == sharedFailedUtteranceId &&
+                  it.isTranslationPending() &&
+                  it.translationAttemptId != "attempt_failed_v1"
+              }
+            }
+            .first { it.id == sharedFailedUtteranceId }
+        }
+
+      // Now Phone B (whose user was looking at failedSnapshotOnB and presses Retry right after Phone A)
+      // triggers retryTranslateUtterance with failedSnapshotOnB:
+      retryVmB.retryTranslateUtterance(
+        session = validSession,
+        utterance = failedSnapshotOnB,
+        onSpeakTranslationReady = { text, lang -> dualRetrySpoken.add(text to lang) },
+      )
+      withTimeout(FLOW_TIMEOUT_MS) {
+        retryVmB.aiTaskState.first { it is AiTaskState.Idle }
+      }
+
+      // Verify Phone B's transaction rejected the claim, so only Phone A called customTranslationGenerator!
+      assertEquals(
+        "Only ONE device (Phone A) must call AI translation when both press Retry on the same failed record",
+        1,
+        dualRetryTranslationCalls,
+      )
+
+      // Also verify that if a stale/wrong attemptId tries to call completeUtteranceTranslationIfAttemptMatches,
+      // the transaction rejects it!
+      val staleCommitResult =
+        withTimeout(DEFAULT_TIMEOUT_MS) {
+          phoneBRepository.completeUtteranceTranslationIfAttemptMatches(
+            userId = aliceUid,
+            sessionId = validSessionId,
+            utteranceId = sharedFailedUtteranceId,
+            expectedAttemptId = "stale_or_wrong_attempt_id",
+            translatedText = "不應寫入的過期譯文",
+            technicalTerms = emptyList(),
+          )
+        }
+      assertFalse(
+        "completeUtteranceTranslationIfAttemptMatches must reject a mismatched attemptId",
+        staleCommitResult,
+      )
+
+      // Now release Phone A's translation -> commits with Phone A's matching attemptId and speaks once!
+      dualRetryGate.complete(
+        """{"translatedText": "雙機同時重試時唯一勝出並寫回的正確譯文。", "technicalTerms": ["CBTC: 號誌"]}"""
+      )
+      val finalResolved =
+        withTimeout(FLOW_TIMEOUT_MS) {
+          phoneBRepository
+            .observeUtterances(aliceUid, validSessionId)
+            .first { list ->
+              list.any {
+                it.id == sharedFailedUtteranceId &&
+                  it.translatedText == "雙機同時重試時唯一勝出並寫回的正確譯文。"
+              }
+            }
+            .first { it.id == sharedFailedUtteranceId }
+        }
+      withTimeout(FLOW_TIMEOUT_MS) {
+        retryVmA.aiTaskState.first { it is AiTaskState.Idle }
+      }
+      assertEquals(claimedInFirestore.translationAttemptId, finalResolved.translationAttemptId)
+      assertEquals(1, dualRetryTranslationCalls)
+      assertEquals(
+        "TTS must only be spoken ONCE across both devices",
+        listOf("雙機同時重試時唯一勝出並寫回的正確譯文。" to "zh-TW"),
+        dualRetrySpoken,
+      )
     }
 
   /**
    * Verifies:
    * 1. Deleting a session deletes the parent session first (blocking concurrent writes via
-   *    `firestore.rules`) and drains all child `utterances` in a loop.
+   *    `firestore.rules`) and drains all child `utterances` in a loop using `Source.SERVER`.
    * 2. If the app process is terminated AFTER the parent session document is deleted—while
-   *    child `utterances` have not finished being deleted—both `MetroVoiceRepository(context, firestore)`
-   *    (used by `MainActivity`) and `MetroVoiceRepository(firestore)` persist the pending `sessionId`
-   *    to real Android `SharedPreferences`, and a brand-new `MetroVoiceRepository` instance
-   *    (with NO shared in-memory object) reads `SharedPreferences` on restart (`observeSessions`)
-   *    and purges all remaining child `utterances`!
+   *    child `utterances` have not finished being deleted—the default `MetroVoiceRepository(firestore)`
+   *    constructor persists the pending `sessionId` to real Android `SharedPreferences`.
+   * 3. If the device loses connectivity during the final `Source.SERVER` verification check,
+   *    the pending delete marker is NOT prematurely cleared from `SharedPreferences`.
+   * 4. When connectivity is restored on the next launch, a brand-new `MetroVoiceRepository(firestore)`
+   *    instance reads `SharedPreferences`, verifies zero remaining child `utterances` on `Source.SERVER`,
+   *    and clears the pending delete marker!
    */
   @Test
   fun deleteSession_deletesChildUtterancesSubcollectionAndBlocksConcurrentWrites() = runBlocking {
@@ -1026,13 +1186,33 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       withTimeout(FLOW_TIMEOUT_MS) { repository.observeUtterances(aliceUid, sessionId).first() }
     assertEquals(2, remainingBeforeResume.size)
 
+    // Verify offline protection: if Source.SERVER fails with UNAVAILABLE on the final zero-doc
+    // verification check, the pending delete marker must stay in SharedPreferences!
+    try {
+      withTimeout(DEFAULT_TIMEOUT_MS) {
+        repository.deleteSession(
+          userId = aliceUid,
+          sessionId = sessionId,
+          simulateOfflineOnFinalServerCheckForTest = true,
+        )
+      }
+      fail("Expected UNAVAILABLE exception when Source.SERVER check fails offline")
+    } catch (e: FirebaseFirestoreException) {
+      assertEquals(FirebaseFirestoreException.Code.UNAVAILABLE, e.code)
+    }
+    assertTrue(
+      "When Source.SERVER verification fails offline, pending delete marker must remain in SharedPreferences",
+      freshPrefsInspector.getPendingDeleteSessionIds(aliceUid).contains(sessionId),
+    )
+
     // Simulate app restart with a brand-new MetroVoiceRepository(firestore) instance (no shared memory!)
     val restartedRepository = MetroVoiceRepository(firestore)
     withTimeout(FLOW_TIMEOUT_MS) {
       restartedRepository.observeSessions(aliceUid).first()
     }
 
-    // Verify restart automatically resumed from SharedPreferences and wiped all leftover child utterances!
+    // Verify restart automatically resumed from SharedPreferences, confirmed 0 docs on Source.SERVER,
+    // and cleared the pending delete marker!
     val afterResumeUtterances =
       withTimeout(FLOW_TIMEOUT_MS) {
         restartedRepository.observeUtterances(aliceUid, sessionId).first()
@@ -1042,7 +1222,7 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       afterResumeUtterances.isEmpty(),
     )
     assertTrue(
-      "SharedPreferences pending delete set must be cleared once cleanup completes",
+      "SharedPreferences pending delete set must be cleared once Source.SERVER cleanup completes",
       freshPrefsInspector.getPendingDeleteSessionIds(aliceUid).isEmpty(),
     )
   }

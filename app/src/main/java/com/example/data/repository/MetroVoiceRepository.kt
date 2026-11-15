@@ -11,7 +11,9 @@ import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
+import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.snapshots
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.flow.Flow
@@ -355,18 +357,22 @@ class MetroVoiceRepository(
   }
 
   /**
-   * Crash-resilient session deletion:
+   * Crash-resilient and offline-safe session deletion:
    * 1. Records [sessionId] in [pendingDeleteStore] (`SharedPreferences`) BEFORE deleting parent.
    * 2. Deletes the parent `TestSession` document so Firestore security rules (`exists(...)`)
    *    and atomic batch checks immediately block any other device from adding new utterances.
-   * 3. Repeatedly queries and batch-deletes the `utterances` subcollection in a loop until
-   *    a fresh query confirms zero child documents remain.
-   * 4. Clears [sessionId] from [pendingDeleteStore] ONLY after all child `utterances` are gone.
+   * 3. Repeatedly queries and batch-deletes the `utterances` subcollection using [Source.SERVER]
+   *    in a loop until a fresh [Source.SERVER] query confirms zero child documents remain on the
+   *    cloud server (never trusting a potentially empty offline local cache).
+   * 4. Clears [sessionId] from [pendingDeleteStore] ONLY after [Source.SERVER] confirms 0 child
+   *    `utterances` remain; if offline, throws `FirebaseFirestoreException(UNAVAILABLE)` so the
+   *    pending delete marker stays in `SharedPreferences` and resumes on next launch.
    */
   suspend fun deleteSession(
     userId: String,
     sessionId: String,
     onAfterFirstSubcollectionQueryForTest: (suspend () -> Unit)? = null,
+    simulateOfflineOnFinalServerCheckForTest: Boolean = false,
   ) {
     val sessionRef =
       db.collection("users").document(userId).collection("sessions").document(sessionId)
@@ -378,10 +384,11 @@ class MetroVoiceRepository(
       // 2. Delete parent session first so any concurrent utterance creation is blocked immediately
       sessionRef.delete().await()
 
-      // 3. Repeatedly drain the utterances subcollection until a query returns empty
+      // 3. Repeatedly drain the utterances subcollection from Source.SERVER until 0 docs remain
       var pass = 0
+      var verifiedEmptyOnServer = false
       while (pass < 20) {
-        val utterancesSnapshot = utterancesCollection.get().await()
+        val utterancesSnapshot = utterancesCollection.get(Source.SERVER).await()
         if (pass == 0 && onAfterFirstSubcollectionQueryForTest != null) {
           onAfterFirstSubcollectionQueryForTest.invoke()
         }
@@ -391,6 +398,13 @@ class MetroVoiceRepository(
             pass++
             continue
           }
+          if (simulateOfflineOnFinalServerCheckForTest) {
+            throw FirebaseFirestoreException(
+              "Simulated offline failure during Source.SERVER final verification",
+              FirebaseFirestoreException.Code.UNAVAILABLE,
+            )
+          }
+          verifiedEmptyOnServer = true
           break
         }
         for (chunk in docs.chunked(450)) {
@@ -403,7 +417,20 @@ class MetroVoiceRepository(
         pass++
       }
 
-      // 4. Clear pending delete entry only after all child utterances have been deleted
+      if (!verifiedEmptyOnServer) {
+        if (simulateOfflineOnFinalServerCheckForTest) {
+          throw FirebaseFirestoreException(
+            "Simulated offline failure during Source.SERVER final verification",
+            FirebaseFirestoreException.Code.UNAVAILABLE,
+          )
+        }
+        val finalServerSnapshot = utterancesCollection.get(Source.SERVER).await()
+        if (!finalServerSnapshot.isEmpty) {
+          throw IllegalStateException("Subcollection still has remaining documents on server")
+        }
+      }
+
+      // 4. Clear pending delete entry only after Source.SERVER confirms zero child utterances remain
       pendingDeleteStore.clearPendingDelete(userId, sessionId)
     } catch (e: CancellationException) {
       throw e
@@ -453,6 +480,7 @@ class MetroVoiceRepository(
     technicalTerms: List<String>,
     isPinnedToMinutes: Boolean = false,
     incrementSessionCount: Boolean = true,
+    translationAttemptId: String = UUID.randomUUID().toString(),
   ): String {
     val uid = requireUserId()
     val sessionRef = db.collection("users").document(uid).collection("sessions").document(sessionId)
@@ -470,6 +498,7 @@ class MetroVoiceRepository(
         "translatedText" to translatedText.trim().take(2000).ifEmpty { "-" },
         "technicalTerms" to technicalTerms.take(15).map { it.take(200) },
         "isPinnedToMinutes" to isPinnedToMinutes,
+        "translationAttemptId" to translationAttemptId.trim().take(128).ifEmpty { "attempt_init" },
         "createdAt" to FieldValue.serverTimestamp(),
         "updatedAt" to FieldValue.serverTimestamp(),
       )
@@ -534,16 +563,75 @@ class MetroVoiceRepository(
   }
 
   /**
+   * Atomically writes the completed translation inside a Firestore transaction ONLY IF the
+   * document is still in the pending (`⏳`) state AND its `translationAttemptId` matches
+   * [expectedAttemptId].
+   * Guarantees that even if two devices somehow raced, only the device holding the active
+   * [expectedAttemptId] can commit its translation.
+   */
+  suspend fun completeUtteranceTranslationIfAttemptMatches(
+    userId: String,
+    sessionId: String,
+    utteranceId: String,
+    expectedAttemptId: String,
+    translatedText: String,
+    technicalTerms: List<String>,
+  ): Boolean {
+    val uttRef =
+      db.collection("users")
+        .document(userId)
+        .collection("sessions")
+        .document(sessionId)
+        .collection("utterances")
+        .document(utteranceId)
+    val cleanTranslation =
+      translatedText.trim().take(2000).ifEmpty {
+        throw IllegalArgumentException("Translated text must not be blank")
+      }
+    return try {
+      db.runTransaction { transaction ->
+          val snapshot = transaction.get(uttRef)
+          if (!snapshot.exists()) return@runTransaction false
+          val currentTranslated = snapshot.getString("translatedText").orEmpty()
+          val currentAttemptId = snapshot.getString("translationAttemptId").orEmpty()
+          if (!currentTranslated.startsWith("⏳")) {
+            return@runTransaction false
+          }
+          if (expectedAttemptId.isNotBlank() && currentAttemptId != expectedAttemptId) {
+            return@runTransaction false
+          }
+          transaction.update(
+            uttRef,
+            mapOf(
+              "translatedText" to cleanTranslation,
+              "technicalTerms" to technicalTerms.take(15).map { it.take(200) },
+              "updatedAt" to FieldValue.serverTimestamp(),
+            ),
+          )
+          true
+        }
+        .await()
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      handleFirestoreError(e, OperationType.UPDATE, uttRef.path)
+      throw e
+    }
+  }
+
+  /**
    * Conditionally marks an utterance as failed inside a Firestore transaction ONLY IF its
-   * current `translatedText` in Firestore is still in the pending (`⏳`) state.
+   * current `translatedText` in Firestore is still in the pending (`⏳`) state and (when
+   * [expectedAttemptId] is provided) its `translationAttemptId` still matches [expectedAttemptId].
    * Prevents a stale timeout recovery or error callback on Device B from overwriting a
-   * completed translation that Device A just saved!
+   * completed translation or a newer retry attempt that Device A started!
    */
   suspend fun markUtteranceFailedIfStillPending(
     userId: String,
     sessionId: String,
     utteranceId: String,
     failedText: String,
+    expectedAttemptId: String? = null,
   ): Boolean {
     val uttRef =
       db.collection("users")
@@ -558,8 +646,13 @@ class MetroVoiceRepository(
           val snapshot = transaction.get(uttRef)
           if (!snapshot.exists()) return@runTransaction false
           val currentTranslated = snapshot.getString("translatedText").orEmpty()
+          val currentAttemptId = snapshot.getString("translationAttemptId").orEmpty()
           if (!currentTranslated.startsWith("⏳")) {
             // Another device already completed (or updated) this translation; do not overwrite!
+            return@runTransaction false
+          }
+          if (!expectedAttemptId.isNullOrBlank() && currentAttemptId != expectedAttemptId) {
+            // Another device already claimed a newer retry attempt; do not overwrite!
             return@runTransaction false
           }
           transaction.update(
@@ -582,14 +675,27 @@ class MetroVoiceRepository(
   }
 
   /**
-   * Atomically claims an utterance for retry inside a Firestore transaction ONLY IF it is
-   * currently in failed (`⚠️`) or pending (`⏳`) state—never overwriting an utterance whose
-   * translation was already completed by another device.
+   * Atomically claims an utterance for retry inside a Firestore transaction ONLY IF:
+   * 1. Its current `translatedText` is still in failed (`⚠️`) or pending (`⏳`) state, AND
+   * 2. Its current `translatedText`, `translationAttemptId`, and `updatedAt` in Firestore
+   *    match the exact snapshot version ([expectedTranslatedText], [expectedAttemptId],
+   *    [expectedUpdatedAt]) that the user saw when pressing Retry!
+   *
+   * When claimed, writes [newAttemptId] into `translationAttemptId` and sets `translatedText`
+   * to [pendingPlaceholder]. If Phone A and Phone B both see the same failed utterance and
+   * press Retry simultaneously, Phone A's transaction updates `translationAttemptId` to
+   * Phone A's [newAttemptId] and `translatedText` to `⏳`, so Phone B's transaction sees a
+   * version mismatch (`currentAttemptId != expectedAttemptId` and `currentTranslated != expectedTranslatedText`)
+   * and returns `false`—guaranteeing only ONE device translates, speaks TTS, and writes back!
    */
   suspend fun claimUtteranceForRetryIfEligible(
     userId: String,
     sessionId: String,
     utteranceId: String,
+    expectedTranslatedText: String,
+    expectedAttemptId: String,
+    expectedUpdatedAt: Timestamp?,
+    newAttemptId: String,
     pendingPlaceholder: String,
   ): Boolean {
     val uttRef =
@@ -604,14 +710,41 @@ class MetroVoiceRepository(
           val snapshot = transaction.get(uttRef)
           if (!snapshot.exists()) return@runTransaction false
           val currentTranslated = snapshot.getString("translatedText").orEmpty()
+          val currentAttemptId = snapshot.getString("translationAttemptId").orEmpty()
+          val currentUpdatedAt = snapshot.getTimestamp("updatedAt")
+
           if (!currentTranslated.startsWith("⚠️") && !currentTranslated.startsWith("⏳")) {
             // Translation already succeeded on another device; do not overwrite or re-translate!
             return@runTransaction false
           }
+          if (currentAttemptId != expectedAttemptId) {
+            // Another device already claimed a new retry attempt token!
+            return@runTransaction false
+          }
+          val isSameAttemptAutoRecoveredToFailed =
+            expectedAttemptId.isNotBlank() &&
+              expectedTranslatedText.startsWith("⏳") &&
+              currentTranslated.startsWith("⚠️")
+          if (!isSameAttemptAutoRecoveredToFailed) {
+            if (currentTranslated != expectedTranslatedText) {
+              // Another device already changed the state (e.g. from ⚠️ to ⏳) after this user's snapshot!
+              return@runTransaction false
+            }
+            if (
+              expectedUpdatedAt != null &&
+                currentUpdatedAt != null &&
+                currentUpdatedAt != expectedUpdatedAt
+            ) {
+              // Document version timestamp changed since the user pressed Retry!
+              return@runTransaction false
+            }
+          }
+
           transaction.update(
             uttRef,
             mapOf(
               "translatedText" to pendingPlaceholder,
+              "translationAttemptId" to newAttemptId.trim().take(128),
               "updatedAt" to FieldValue.serverTimestamp(),
             ),
           )

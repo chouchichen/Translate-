@@ -62,6 +62,7 @@ service cloud.firestore {
              data.translatedText is string && data.translatedText.size() >= 1 && data.translatedText.size() <= 2000 &&
              isBoundedStringList(data.technicalTerms, 15, 200) &&
              data.isPinnedToMinutes is bool &&
+             (!('translationAttemptId' in data) || (data.translationAttemptId is string && data.translationAttemptId.size() <= 128)) &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
@@ -122,7 +123,8 @@ service cloud.firestore {
                          incoming().keys().hasOnly([
                            'userId', 'sessionId', 'speakerRole', 'speakerLabel',
                            'sourceLang', 'targetLang', 'originalText', 'translatedText',
-                           'technicalTerms', 'isPinnedToMinutes', 'createdAt', 'updatedAt'
+                           'technicalTerms', 'isPinnedToMinutes', 'translationAttemptId',
+                           'createdAt', 'updatedAt'
                          ]) &&
                          isValidUtterance(incoming(), userId, sessionId);
 
@@ -138,7 +140,7 @@ service cloud.firestore {
                          incoming().createdAt == existing().createdAt &&
                          incoming().diff(existing()).affectedKeys().hasOnly([
                            'originalText', 'translatedText', 'technicalTerms',
-                           'isPinnedToMinutes', 'updatedAt'
+                           'isPinnedToMinutes', 'translationAttemptId', 'updatedAt'
                          ]);
 
         allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidId(sessionId) && isValidId(utteranceId);

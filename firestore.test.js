@@ -74,6 +74,7 @@ function validUtterancePayload(userId, sessionId) {
     translatedText: "請確認第二月台 CBTC 信標交遞的延遲時間。",
     technicalTerms: ["CBTC: 通訊式列車控制", "Beacon handover: 信標交遞"],
     isPinnedToMinutes: true,
+    translationAttemptId: "attempt_init_001",
     createdAt: now,
     updatedAt: now,
   };
