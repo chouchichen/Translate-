@@ -535,6 +535,7 @@ fun DualChannelControlDeck(
 fun UtteranceBilingualCard(
   utterance: Utterance,
   activeTranslatingIds: Set<String> = emptySet(),
+  localInterruptedIds: Set<String> = emptySet(),
   onSpeakText: (text: String, langTag: String) -> Unit,
   onTogglePin: (Utterance) -> Unit,
   onOpenSpotlight: (Utterance) -> Unit,
@@ -543,7 +544,7 @@ fun UtteranceBilingualCard(
   val isForeignSpeaker = utterance.speakerRole == "FOREIGN_ENGINEER"
   val isFailed = utterance.isTranslationFailed()
   val isPending = utterance.isTranslationPending()
-  val canRetry = utterance.canRetryTranslation(activeTranslatingIds)
+  val canRetry = utterance.canRetryTranslation(activeTranslatingIds, localInterruptedIds)
 
   val accentColor =
     when {

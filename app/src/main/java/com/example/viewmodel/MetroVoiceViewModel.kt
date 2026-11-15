@@ -44,13 +44,26 @@ fun Utterance.isTranslationFailed(): Boolean =
   translatedText.startsWith("⚠️")
 
 /**
- * An utterance can be retried in the UI if it failed (`⚠️`) OR if it is stuck in pending (`⏳`)
- * while no active translation coroutine on this device is currently processing it.
- * Note: This is a pure read-only UI check that never mutates shared cloud records while
- * another device may still be translating within the timeout window.
+ * Multi-device safe retry check:
+ * - Failed utterances (`⚠️`) are always retryable (when not currently translating on this device).
+ * - Pending utterances (`⏳`) are retryable ONLY if:
+ *   1. They were started on THIS device prior to a process termination (`id in localInterruptedIds`), OR
+ *   2. Their timestamp has exceeded [TRANSLATION_STALE_TIMEOUT_MS] (65s > 60s model timeout).
+ * This prevents a second device (Phone B) from manually clicking retry within 65s while
+ * Phone A is still actively translating the sentence.
  */
-fun Utterance.canRetryTranslation(activeTranslatingIds: Set<String> = emptySet()): Boolean =
-  isTranslationFailed() || (isTranslationPending() && id !in activeTranslatingIds)
+fun Utterance.canRetryTranslation(
+  activeTranslatingIds: Set<String> = emptySet(),
+  localInterruptedIds: Set<String> = emptySet(),
+  nowEpochMs: Long = System.currentTimeMillis(),
+): Boolean {
+  if (id in activeTranslatingIds) return false
+  if (isTranslationFailed()) return true
+  if (isTranslationPending()) {
+    return id in localInterruptedIds || isStalePendingTranslation(nowEpochMs)
+  }
+  return false
+}
 
 fun Utterance.isStalePendingTranslation(nowEpochMs: Long = System.currentTimeMillis()): Boolean {
   if (!isTranslationPending()) return false
@@ -79,6 +92,22 @@ class MetroVoiceViewModel(
     (suspend (session: TestSession, speakerRole: String, spokenText: String) -> String)? =
     null,
 ) : ViewModel() {
+
+  /**
+   * Preserves spoken-order TTS playback even when a shorter second sentence finishes AI
+   * translation before a longer first sentence.
+   */
+  private class OrderedSpeechSlot(
+    val slotId: Long,
+    val onSpeakTranslationReady: (String, String) -> Unit,
+    var isReady: Boolean = false,
+    var translatedText: String? = null,
+    var targetLang: String? = null,
+    var isFailedOrSkipped: Boolean = false,
+  )
+
+  private var nextSpeechSlotId = 1L
+  private val speechOrderQueue = ArrayDeque<OrderedSpeechSlot>()
 
   private val translationSchema =
     Schema.obj(
@@ -165,6 +194,11 @@ class MetroVoiceViewModel(
   val activeTranslatingUtteranceIds: StateFlow<Set<String>> =
     _activeTranslatingUtteranceIds.asStateFlow()
 
+  private val _localInterruptedUtteranceIds =
+    MutableStateFlow(repository.getInterruptedTranslationIds(currentUserId))
+  val localInterruptedUtteranceIds: StateFlow<Set<String>> =
+    _localInterruptedUtteranceIds.asStateFlow()
+
   @Volatile private var inFlightCreationCount: Int = 0
   private val recoveringOrphanIds = mutableSetOf<String>()
 
@@ -222,26 +256,31 @@ class MetroVoiceViewModel(
           repository
             .observeUtterances(currentUserId, sessionId)
             .map<List<Utterance>, DataUiState<List<Utterance>>> { list ->
-              // Only auto-mark a "⏳ [口譯處理中...]" utterance as failed in Firestore if its
-              // timestamp has exceeded TRANSLATION_STALE_TIMEOUT_MS (65s > 60s model timeout).
-              // This ensures a second device (Phone B) viewing the same session never overwrites
-              // an utterance that Phone A is actively translating right now!
+              // Only auto-mark a "⏳ [口譯處理中...]" utterance as failed in Firestore if:
+              // 1. It was recorded in THIS device's own interrupted translation store before a crash, OR
+              // 2. Its timestamp has exceeded TRANSLATION_STALE_TIMEOUT_MS (65s > 60s model timeout).
+              // And use a conditional Firestore transaction (`markUtteranceFailedIfStillPending`)
+              // so it NEVER overwrites a completed translation that another device just saved!
               if (inFlightCreationCount == 0) {
                 val activeIds = _activeTranslatingUtteranceIds.value
+                val interruptedOnThisDevice = _localInterruptedUtteranceIds.value
                 val nowMs = System.currentTimeMillis()
                 list.forEach { utt ->
-                  if (
+                  val shouldRecover =
                     utt.id.isNotBlank() &&
-                      utt.isStalePendingTranslation(nowMs) &&
+                      utt.isTranslationPending() &&
                       utt.id !in activeIds &&
-                      recoveringOrphanIds.add(utt.id)
-                  ) {
+                      (utt.id in interruptedOnThisDevice || utt.isStalePendingTranslation(nowMs))
+                  if (shouldRecover && recoveringOrphanIds.add(utt.id)) {
                     viewModelScope.launch {
                       markUtteranceTranslationFailed(
                         utt.sessionId,
                         utt.id,
-                        "上次口譯逾時未完成，請點擊重試",
+                        "上次口譯未完成，請點擊重試",
                       )
+                      repository.clearInFlightTranslation(currentUserId, utt.id)
+                      _localInterruptedUtteranceIds.value =
+                        _localInterruptedUtteranceIds.value - utt.id
                     }
                   }
                 }
@@ -281,6 +320,53 @@ class MetroVoiceViewModel(
   fun clearAiError() {
     if (_aiTaskState.value is AiTaskState.Error) {
       _aiTaskState.value = AiTaskState.Idle
+    }
+  }
+
+  private fun markSpeechSlotReadyAndDrain(
+    slot: OrderedSpeechSlot,
+    translatedText: String,
+    targetLang: String,
+  ) {
+    synchronized(speechOrderQueue) {
+      slot.translatedText = translatedText
+      slot.targetLang = targetLang
+      slot.isReady = true
+    }
+    drainSpeechOrderQueue()
+  }
+
+  private fun markSpeechSlotFailedAndDrain(slot: OrderedSpeechSlot) {
+    synchronized(speechOrderQueue) {
+      slot.isFailedOrSkipped = true
+    }
+    drainSpeechOrderQueue()
+  }
+
+  private fun drainSpeechOrderQueue() {
+    val readyCallbacks = mutableListOf<Triple<(String, String) -> Unit, String, String>>()
+    synchronized(speechOrderQueue) {
+      while (speechOrderQueue.isNotEmpty()) {
+        val head = speechOrderQueue.first()
+        if (head.isFailedOrSkipped) {
+          speechOrderQueue.removeFirst()
+          continue
+        }
+        if (!head.isReady) {
+          // Earlier spoken sentence is still translating; hold later sentences so TTS
+          // always speaks in the exact order the sentences were spoken!
+          break
+        }
+        speechOrderQueue.removeFirst()
+        val text = head.translatedText
+        val lang = head.targetLang
+        if (!text.isNullOrBlank() && !lang.isNullOrBlank() && _autoSpeakTranslation.value) {
+          readyCallbacks.add(Triple(head.onSpeakTranslationReady, text, lang))
+        }
+      }
+    }
+    readyCallbacks.forEach { (callback, text, lang) ->
+      callback.invoke(text, lang)
     }
   }
 
@@ -493,11 +579,12 @@ class MetroVoiceViewModel(
 
   /**
    * Bidirectional Real-Time Translation via Firebase AI Logic (Gemini 3.8 Flash):
-   * 1. Immediately persists the recognized [spokenText] (`originalText`) to Firestore.
-   *    If this initial write fails, reports clearly that the transcript could NOT be saved
-   *    (never falsely claiming that `originalText` was saved).
-   * 2. Translates the utterance and updates the saved Firestore document.
-   * 3. Automatically triggers [onSpeakTranslationReady] when `_autoSpeakTranslation` is enabled.
+   * 1. Assigns an [OrderedSpeechSlot] in the exact call order so that even if a shorter second
+   *    sentence finishes AI translation before a longer first sentence, TTS speech output always
+   *    plays in strict spoken order (Sentence 1 first, Sentence 2 second).
+   * 2. Immediately persists the recognized [spokenText] (`originalText`) to Firestore and records
+   *    the utterance ID in THIS device's `PendingTranslationStore` (`SharedPreferences`).
+   * 3. Translates the utterance and updates the saved Firestore document.
    */
   fun translateAndRecordUtterance(
     session: TestSession,
@@ -507,6 +594,14 @@ class MetroVoiceViewModel(
   ) {
     val cleanInput = spokenText.trim()
     if (cleanInput.isEmpty()) return
+
+    val speechSlot =
+      synchronized(speechOrderQueue) {
+        OrderedSpeechSlot(
+          slotId = nextSpeechSlotId++,
+          onSpeakTranslationReady = onSpeakTranslationReady,
+        ).also { speechOrderQueue.addLast(it) }
+      }
 
     val isForeignSpeaker = speakerRole == "FOREIGN_ENGINEER"
     val sourceLang = if (isForeignSpeaker) session.foreignLangCode else "zh-TW"
@@ -522,7 +617,6 @@ class MetroVoiceViewModel(
       _aiTaskState.value = AiTaskState.Translating(speakerRole, cleanInput)
 
       // Step 1: Persist recognized originalText to Firestore first.
-      // If this initial write fails, report accurately that the transcript was NOT saved!
       val savedUtteranceId: String =
         try {
           inFlightCreationCount++
@@ -538,11 +632,14 @@ class MetroVoiceViewModel(
               technicalTerms = emptyList(),
               isPinnedToMinutes = false,
             )
+          repository.markInFlightTranslation(currentUserId, newId)
           _activeTranslatingUtteranceIds.value = _activeTranslatingUtteranceIds.value + newId
           newId
         } catch (e: CancellationException) {
+          markSpeechSlotFailedAndDrain(speechSlot)
           throw e
         } catch (e: Exception) {
+          markSpeechSlotFailedAndDrain(speechSlot)
           Log.e(TAG, "Initial Firestore write for utterance failed", e)
           _aiTaskState.value =
             AiTaskState.Error(
@@ -557,9 +654,8 @@ class MetroVoiceViewModel(
       try {
         val result = executeAiTranslation(session, speakerRole, cleanInput)
 
-        if (_autoSpeakTranslation.value) {
-          onSpeakTranslationReady(result.translatedText, targetLang)
-        }
+        // Dispatch speech strictly in spoken order via speechOrderQueue!
+        markSpeechSlotReadyAndDrain(speechSlot, result.translatedText, targetLang)
 
         repository.updateUtteranceTranslation(
           userId = currentUserId,
@@ -571,13 +667,16 @@ class MetroVoiceViewModel(
 
         _aiTaskState.value = AiTaskState.Idle
       } catch (e: TimeoutCancellationException) {
+        markSpeechSlotFailedAndDrain(speechSlot)
         Log.e(TAG, "Translation timed out", e)
         markUtteranceTranslationFailed(session.id, savedUtteranceId, "連線逾時")
         _aiTaskState.value =
           AiTaskState.Error("即時口譯逾時（原文已保存至逐字稿，可直接點擊該句「重試翻譯」）。")
       } catch (e: CancellationException) {
+        markSpeechSlotFailedAndDrain(speechSlot)
         throw e
       } catch (e: Exception) {
+        markSpeechSlotFailedAndDrain(speechSlot)
         Log.e(TAG, "Firebase AI translation failed", e)
         markUtteranceTranslationFailed(
           session.id,
@@ -589,6 +688,9 @@ class MetroVoiceViewModel(
             "即時口譯失敗：${e.localizedMessage ?: "請稍後再試"}（原文已保存至逐字稿，可點擊「重試翻譯」）"
           )
       } finally {
+        repository.clearInFlightTranslation(currentUserId, savedUtteranceId)
+        _localInterruptedUtteranceIds.value =
+          _localInterruptedUtteranceIds.value - savedUtteranceId
         _activeTranslatingUtteranceIds.value =
           _activeTranslatingUtteranceIds.value - savedUtteranceId
       }
@@ -597,11 +699,11 @@ class MetroVoiceViewModel(
 
   /**
    * Retries AI translation for an already-persisted [Utterance] whose initial translation
-   * failed, timed out, or was interrupted (`⏳` or `⚠️`).
-   * Strictly uses the utterance's own pinned [Utterance.sourceLang] and [Utterance.targetLang]
-   * so that even if the user later changed the session's language chip (e.g. from English to
-   * Japanese), the translation prompt, the stored language tag, and the TTS voice engine
-   * remain 100% consistent.
+   * failed, timed out, or was interrupted on this device (`canRetryTranslation`).
+   * - Guards with [Utterance.canRetryTranslation] so a second device (Phone B) cannot manually
+   *   trigger a concurrent retry within 65s while Phone A is still actively translating.
+   * - Uses a conditional Firestore transaction (`claimUtteranceForRetryIfEligible`) before
+   *   calling the model so it never overwrites a completed translation from another device.
    */
   fun retryTranslateUtterance(
     session: TestSession,
@@ -609,6 +711,14 @@ class MetroVoiceViewModel(
     onSpeakTranslationReady: (textToSpeak: String, languageTag: String) -> Unit,
   ) {
     if (utterance.id.isBlank() || utterance.originalText.isBlank()) return
+    if (
+      !utterance.canRetryTranslation(
+        activeTranslatingIds = _activeTranslatingUtteranceIds.value,
+        localInterruptedIds = _localInterruptedUtteranceIds.value,
+      )
+    ) {
+      return
+    }
 
     val isForeignSpeaker = utterance.speakerRole == "FOREIGN_ENGINEER"
     val pinnedForeignLangCode =
@@ -636,15 +746,21 @@ class MetroVoiceViewModel(
 
     viewModelScope.launch {
       _activeTranslatingUtteranceIds.value = _activeTranslatingUtteranceIds.value + utterance.id
+      repository.markInFlightTranslation(currentUserId, utterance.id)
       _aiTaskState.value = AiTaskState.Translating(utterance.speakerRole, utterance.originalText)
       try {
-        repository.updateUtteranceTranslation(
-          userId = currentUserId,
-          sessionId = utterance.sessionId,
-          utteranceId = utterance.id,
-          translatedText = PENDING_TRANSLATION_PLACEHOLDER,
-          technicalTerms = utterance.technicalTerms,
-        )
+        val claimed =
+          repository.claimUtteranceForRetryIfEligible(
+            userId = currentUserId,
+            sessionId = utterance.sessionId,
+            utteranceId = utterance.id,
+            pendingPlaceholder = PENDING_TRANSLATION_PLACEHOLDER,
+          )
+        if (!claimed) {
+          // Another device already completed translating this utterance; do not overwrite!
+          _aiTaskState.value = AiTaskState.Idle
+          return@launch
+        }
 
         val result =
           executeAiTranslation(
@@ -682,6 +798,9 @@ class MetroVoiceViewModel(
         _aiTaskState.value =
           AiTaskState.Error("重試口譯失敗：${e.localizedMessage ?: "請稍後再試"}")
       } finally {
+        repository.clearInFlightTranslation(currentUserId, utterance.id)
+        _localInterruptedUtteranceIds.value =
+          _localInterruptedUtteranceIds.value - utterance.id
         _activeTranslatingUtteranceIds.value =
           _activeTranslatingUtteranceIds.value - utterance.id
       }
@@ -695,12 +814,11 @@ class MetroVoiceViewModel(
   ) {
     if (utteranceId.isNullOrBlank()) return
     try {
-      repository.updateUtteranceTranslation(
+      repository.markUtteranceFailedIfStillPending(
         userId = currentUserId,
         sessionId = sessionId,
         utteranceId = utteranceId,
-        translatedText = "$FAILED_TRANSLATION_PREFIX（$reason）",
-        technicalTerms = emptyList(),
+        failedText = "$FAILED_TRANSLATION_PREFIX（$reason）",
       )
     } catch (_: Exception) {}
   }

@@ -84,7 +84,7 @@ fun MetroVoiceAppContent() {
                 val databaseId = app.getString(R.string.firestore_database_id)
                 val db = FirebaseFirestore.getInstance(databaseId)
                 MetroVoiceViewModel(
-                  repository = MetroVoiceRepository(db),
+                  repository = MetroVoiceRepository(context = app, db = db),
                   currentUserId = uid,
                 )
               }

@@ -224,17 +224,25 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
 
   /**
    * Verifies realistic turn-taking through the `SpeechRecognizerEngine` and `TtsDriver` lifecycles:
-   * 1. Foreign engineer speaks in Turn 1 (`en-US` -> `zh-TW`), and local engineer immediately presses
-   *    the second mic (`zh-TW` -> `en-US`) BEFORE Turn 1's final `onResults` arrives.
-   * 2. `VoiceBridgeManager` calls `stopListening()` on Turn 1 and waits for Turn 1 to finish before
-   *    starting Turn 2's hardware recognizer so the two recognizers do not collide.
-   * 3. When Turn 2's recognizer starts, the simulated phone speech service returns
-   *    `SpeechRecognizer.ERROR_RECOGNIZER_BUSY` on the first try; `VoiceBridgeManager` automatically
-   *    retries (`busyRetryCount`) and captures Turn 2's speech without dropping the turn!
-   * 4. While Turn 1's `zh-TW` translation is still being spoken aloud by `TtsDriver`, Turn 2's
-   *    `en-US` translation finishes. `VoiceBridgeManager` enqueues Turn 2 (`QUEUE_ADD`, NEVER
-   *    `QUEUE_FLUSH`), does NOT cut off Turn 1 mid-sentence, and only switches `TtsDriver` to
-   *    `en-US` and plays Turn 2 after Turn 1's `onDone` completes!
+   * 1. Rapid 3+ Mic Presses (Foreign -> Local -> Foreign before Turn 1 finishes):
+   *    - Turn 1 (`FOREIGN_TO_LOCAL`) starts its hardware recognizer.
+   *    - User presses Local (`LOCAL_TO_FOREIGN`, Turn 2) before Turn 1's `onResults` arrives ->
+   *      Turn 1 receives `stopListening()` and Turn 2 waits (`isWaitingForPreviousTurn = true`).
+   *    - User immediately presses Foreign (`FOREIGN_TO_LOCAL`, Turn 3) again BEFORE Turn 1's
+   *      `onResults` arrives! Because Turn 2 never acquired a recognizer, `VoiceBridgeManager`
+   *      discards Turn 2 cleanly instead of adding it to `pendingFinalizingAttempts`, so when
+   *      Turn 1's `onResults` arrives, Turn 3 immediately starts without deadlocking!
+   * 2. Subsequent Turn 4 (`LOCAL_TO_FOREIGN`) pressed before Turn 3 finishes:
+   *    - When Turn 4's recognizer starts, the simulated phone speech service returns
+   *      `SpeechRecognizer.ERROR_RECOGNIZER_BUSY` on the first try; `VoiceBridgeManager`
+   *      automatically retries (`busyRetryCount`) and captures Turn 4's speech!
+   * 3. Out-of-order AI Translation + Cold-Start TTS Engine Initialization:
+   *    - Turn 4's short translation finishes BEFORE Turn 1's long translation (`CompletableDeferred`),
+   *      AND both arrive while `TtsDriver.isInitiallyReady == false` (cold start before `onInit`).
+   *    - `MetroVoiceViewModel` buffers speech callbacks in strict spoken order (`speechOrderQueue`),
+   *      and `VoiceBridgeManager` holds items in `speechQueue` until `onTtsEngineReady()` fires,
+   *      then speaks Turn 1 -> Turn 3 -> Turn 4 in exact chronological order without deadlocking
+   *      or using `QUEUE_FLUSH`!
    */
   @Test
   fun turnTakingMicrophone_secondMicPressedBeforeFirstResultArrives_preservesBothInCorrectDirection() =
@@ -256,8 +264,6 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       val session =
         withTimeout(DEFAULT_TIMEOUT_MS) { repository.getSessionById(aliceUid, sessionId)!! }
 
-      // Simulated Android Speech Recognition Service that enforces single-active-recognizer
-      // and injects ERROR_RECOGNIZER_BUSY on the first attempt of Turn 2
       open class FakeRecognizerInstance : SpeechRecognizerEngine {
         var listener: RecognitionListener? = null
         var startedLanguage: String? = null
@@ -288,16 +294,18 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       val createdRecognizers = mutableListOf<FakeRecognizerInstance>()
       var simulateBusyOnNextStart = false
 
-      // Simulated asynchronous Android TextToSpeech driver that holds each utterance active
-      // until completeCurrentUtterance() is called, verifying no QUEUE_FLUSH cutoff occurs!
+      // Simulate Cold-Start TTS (isInitiallyReady = false) where speech requests arrive BEFORE
+      // TextToSpeech.OnInitListener fires!
       var ttsOnStart: ((String) -> Unit)? = null
       var ttsOnDone: ((String) -> Unit)? = null
       var currentTtsLocale: Locale? = null
       val activeTtsQueue = ArrayDeque<Triple<String, String, String>>() // (utteranceId, text, langTag)
       var everUsedQueueFlush = false
 
-      val fakeTtsDriver =
+      val fakeColdStartTtsDriver =
         object : TtsDriver {
+          override val isInitiallyReady: Boolean = false
+
           override fun setProgressListener(
             onStart: (utteranceId: String) -> Unit,
             onDone: (utteranceId: String) -> Unit,
@@ -333,13 +341,18 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
           }
         }
 
+      // Gate Turn 1's AI translation so Turn 3 and Turn 4 finish translating BEFORE Turn 1!
+      val turn1TranslationGate = CompletableDeferred<String>()
+
       val viewModel =
         MetroVoiceViewModel(
           repository = repository,
           currentUserId = aliceUid,
           autoSeedOnEmpty = false,
           customTranslationGenerator = { _, speakerRole, spokenText ->
-            if (speakerRole == "FOREIGN_ENGINEER") {
+            if (spokenText.contains("Beacon handover")) {
+              turn1TranslationGate.await()
+            } else if (speakerRole == "FOREIGN_ENGINEER") {
               """{"translatedText": "【中譯】$spokenText", "technicalTerms": []}"""
             } else {
               """{"translatedText": "[EN] $spokenText", "technicalTerms": []}"""
@@ -373,10 +386,11 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
               }
             }
           },
-          customTtsDriver = fakeTtsDriver,
+          customTtsDriver = fakeColdStartTtsDriver,
         )
 
-      // 1. Turn 1: Foreign engineer starts speaking (en-US -> zh-TW)
+      // 1. Rapid 3-Press Scenario:
+      // Press 1: Foreign engineer starts speaking (en-US -> zh-TW)
       voiceBridge.startListening(
         channel = ListeningChannel.FOREIGN_TO_LOCAL,
         session = session,
@@ -384,22 +398,25 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       assertEquals(1, createdRecognizers.size)
       assertEquals("en-US", createdRecognizers[0].startedLanguage)
 
-      // 2. Turn 2: Local engineer immediately presses the second mic (zh-TW -> en-US) BEFORE Turn 1's onResults arrives!
-      // Verify Turn 1 receives stopListening(), and Turn 2 waits for Turn 1 to finish before starting its recognizer.
-      simulateBusyOnNextStart = true
+      // Press 2: Local engineer presses Local mic BEFORE Turn 1's onResults arrives
       voiceBridge.startListening(
         channel = ListeningChannel.LOCAL_TO_FOREIGN,
         session = session,
       )
       assertTrue("Turn 1 recognizer must receive stopListening()", createdRecognizers[0].stopCalled)
-      assertEquals(
-        "Turn 2 must wait for Turn 1 to finish before starting a second recognizer",
-        1,
-        createdRecognizers.size,
-      )
+      assertEquals(1, createdRecognizers.size)
       assertEquals(ListeningChannel.LOCAL_TO_FOREIGN, voiceBridge.state.value.activeChannel)
 
-      // 3. Turn 1 delivers its final result -> triggers Turn 2 recognizer -> first attempt hits ERROR_RECOGNIZER_BUSY -> auto-retries!
+      // Press 3: Foreign mic is pressed AGAIN before Turn 1's onResults arrives!
+      // Turn 2 (which never acquired a recognizer) must be discarded so Turn 3 does not deadlock!
+      voiceBridge.startListening(
+        channel = ListeningChannel.FOREIGN_TO_LOCAL,
+        session = session,
+      )
+      assertEquals(1, createdRecognizers.size)
+      assertEquals(ListeningChannel.FOREIGN_TO_LOCAL, voiceBridge.state.value.activeChannel)
+
+      // Now Turn 1's recognizer delivers its final result -> Turn 3 must immediately start recognizer[1]!
       val turn1Bundle =
         Bundle().apply {
           putStringArrayList(
@@ -409,80 +426,121 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
         }
       createdRecognizers[0].listener?.onResults(turn1Bundle)
 
-      // Verify Turn 2 automatically started, hit ERROR_RECOGNIZER_BUSY on recognizer[1], and auto-retried on recognizer[2]!
       assertEquals(
-        "Turn 2 must automatically retry when speech service returns ERROR_RECOGNIZER_BUSY",
-        3,
+        "Turn 3 must immediately start its recognizer once Turn 1 finishes (no deadlock from Turn 2)",
+        2,
         createdRecognizers.size,
       )
-      assertEquals("zh-TW", createdRecognizers[2].startedLanguage)
-      assertEquals(ListeningChannel.LOCAL_TO_FOREIGN, voiceBridge.state.value.activeChannel)
+      assertEquals("en-US", createdRecognizers[1].startedLanguage)
+      assertEquals(ListeningChannel.FOREIGN_TO_LOCAL, voiceBridge.state.value.activeChannel)
 
-      // 4. Now Turn 2 finishes speaking and delivers its result on the retried recognizer[2]
-      voiceBridge.finishListening()
-      val turn2Bundle =
+      // 2. Now while Turn 3 is active, Local engineer presses Local mic (Turn 4) BEFORE Turn 3's onResults arrives,
+      // and we also simulate ERROR_RECOGNIZER_BUSY when Turn 4 starts its recognizer:
+      simulateBusyOnNextStart = true
+      voiceBridge.startListening(
+        channel = ListeningChannel.LOCAL_TO_FOREIGN,
+        session = session,
+      )
+      assertTrue(createdRecognizers[1].stopCalled)
+
+      // Turn 3 delivers its result -> triggers Turn 4 recognizer[2] (BUSY) -> auto-retries on recognizer[3]!
+      val turn3Bundle =
         Bundle().apply {
           putStringArrayList(
             SpeechRecognizer.RESULTS_RECOGNITION,
-            arrayListOf("收到，應答器延遲符合規範。"),
+            arrayListOf("Please confirm emergency brake distance."),
           )
         }
-      createdRecognizers[2].listener?.onResults(turn2Bundle)
+      createdRecognizers[1].listener?.onResults(turn3Bundle)
+
+      assertEquals(
+        "Turn 4 must automatically retry when speech service returns ERROR_RECOGNIZER_BUSY",
+        4,
+        createdRecognizers.size,
+      )
+      assertEquals("zh-TW", createdRecognizers[3].startedLanguage)
+
+      // Turn 4 finishes speaking and delivers its result on recognizer[3]
+      voiceBridge.finishListening()
+      val turn4Bundle =
+        Bundle().apply {
+          putStringArrayList(
+            SpeechRecognizer.RESULTS_RECOGNITION,
+            arrayListOf("收到，應答器延遲與緊急煞車距離均符合規範。"),
+          )
+        }
+      createdRecognizers[3].listener?.onResults(turn4Bundle)
       assertEquals(ListeningChannel.NONE, voiceBridge.state.value.activeChannel)
 
-      // 5. Wait for both utterances to finish translating and saving in Firestore
-      val utterances =
-        withTimeout(FLOW_TIMEOUT_MS) {
-          repository.observeUtterances(aliceUid, sessionId).first { list ->
-            list.size == 2 &&
-              list.any { it.translatedText == "【中譯】Beacon handover latency is 12 ms." } &&
-              list.any { it.translatedText == "[EN] 收到，應答器延遲符合規範。" }
-          }
+      // 3. Verify Out-of-Order Translation Protection:
+      // Turn 3 and Turn 4 finish translating while Turn 1's translation is still waiting on turn1TranslationGate!
+      withTimeout(FLOW_TIMEOUT_MS) {
+        repository.observeUtterances(aliceUid, sessionId).first { list ->
+          list.size == 3 &&
+            list.any { it.translatedText == "【中譯】Please confirm emergency brake distance." } &&
+            list.any { it.translatedText == "[EN] 收到，應答器延遲與緊急煞車距離均符合規範。" }
         }
+      }
+      // Because Turn 1 hasn't finished translating yet, neither Turn 3 nor Turn 4 should jump ahead in TTS!
+      assertEquals(
+        "Out-of-order translations (Turn 3 & Turn 4) must wait for Turn 1 so spoken order is preserved",
+        0,
+        voiceBridge.state.value.pendingSpeechQueueSize,
+      )
+
+      // Now release Turn 1's AI translation -> all 3 sentences (Turn 1, Turn 3, Turn 4) are flushed
+      // in exact spoken order to VoiceBridgeManager while TTS is still in cold-start (not ready yet)!
+      turn1TranslationGate.complete(
+        """{"translatedText": "【中譯】Beacon handover latency is 12 ms.", "technicalTerms": []}"""
+      )
       withTimeout(FLOW_TIMEOUT_MS) {
         viewModel.aiTaskState.first { it is AiTaskState.Idle }
       }
 
-      val foreignUtt = utterances.first { it.speakerRole == "FOREIGN_ENGINEER" }
-      assertEquals("Beacon handover latency is 12 ms.", foreignUtt.originalText)
-      assertEquals("en-US", foreignUtt.sourceLang)
-      assertEquals("zh-TW", foreignUtt.targetLang)
-
-      val localUtt = utterances.first { it.speakerRole == "LOCAL_ENGINEER" }
-      assertEquals("收到，應答器延遲符合規範。", localUtt.originalText)
-      assertEquals("zh-TW", localUtt.sourceLang)
-      assertEquals("en-US", localUtt.targetLang)
-
-      // 6. Verify Sequential TTS Queue:
-      // While Turn 1's TTS has NOT yet called onDone, Turn 2's translation arrived.
-      // Verify Turn 1 was NOT cut off by QUEUE_FLUSH, only Turn 1 has been dispatched to TtsDriver so far,
-      // and Turn 2 is waiting in pendingSpeechQueueSize!
-      assertFalse("TTS must never use QUEUE_FLUSH to cut off ongoing speech", everUsedQueueFlush)
+      // 4. Verify Cold-Start TTS Queue:
+      // Because fakeColdStartTtsDriver.isInitiallyReady == false, all 3 sentences must be queued
+      // in pendingSpeechQueueSize (3) and activeTtsQueue is still empty until onTtsEngineReady() fires!
       assertEquals(
-        "Only Turn 1 should be dispatched to TTS engine while Turn 1 is still speaking",
-        1,
-        activeTtsQueue.size,
+        "Before TTS engine finishes initializing, all 3 sentences must be queued without dropping Sentence 1",
+        3,
+        voiceBridge.state.value.pendingSpeechQueueSize,
       )
-      assertEquals(1, voiceBridge.state.value.pendingSpeechQueueSize)
-      val (turn1TtsId, turn1TtsText, turn1TtsLang) = activeTtsQueue.removeFirst()
-      assertEquals("【中譯】Beacon handover latency is 12 ms.", turn1TtsText)
-      assertEquals("zh-TW", turn1TtsLang)
+      assertEquals(0, activeTtsQueue.size)
 
-      // Now complete Turn 1's TTS playback -> must automatically dispatch Turn 2 in en-US!
-      ttsOnDone?.invoke(turn1TtsId)
+      // Now TTS engine finishes initializing -> Sentence 1 must immediately start speaking!
+      voiceBridge.onTtsEngineReady()
+      assertFalse("TTS must never use QUEUE_FLUSH", everUsedQueueFlush)
+      assertEquals(1, activeTtsQueue.size)
+      assertEquals(2, voiceBridge.state.value.pendingSpeechQueueSize)
+
+      val (tts1Id, tts1Text, tts1Lang) = activeTtsQueue.removeFirst()
+      assertEquals("【中譯】Beacon handover latency is 12 ms.", tts1Text)
+      assertEquals("zh-TW", tts1Lang)
+
+      // Complete Sentence 1 -> dispatches Sentence 2 (Turn 3)
+      ttsOnDone?.invoke(tts1Id)
+      assertEquals(1, activeTtsQueue.size)
+      assertEquals(1, voiceBridge.state.value.pendingSpeechQueueSize)
+      val (tts2Id, tts2Text, tts2Lang) = activeTtsQueue.removeFirst()
+      assertEquals("【中譯】Please confirm emergency brake distance.", tts2Text)
+      assertEquals("zh-TW", tts2Lang)
+
+      // Complete Sentence 2 -> dispatches Sentence 3 (Turn 4)
+      ttsOnDone?.invoke(tts2Id)
       assertEquals(1, activeTtsQueue.size)
       assertEquals(0, voiceBridge.state.value.pendingSpeechQueueSize)
-      val (turn2TtsId, turn2TtsText, turn2TtsLang) = activeTtsQueue.removeFirst()
-      assertEquals("[EN] 收到，應答器延遲符合規範。", turn2TtsText)
-      assertEquals("en-US", turn2TtsLang)
+      val (tts3Id, tts3Text, tts3Lang) = activeTtsQueue.removeFirst()
+      assertEquals("[EN] 收到，應答器延遲與緊急煞車距離均符合規範。", tts3Text)
+      assertEquals("en-US", tts3Lang)
 
-      // Complete Turn 2's TTS playback -> verify both completed in exact FIFO order!
-      ttsOnDone?.invoke(turn2TtsId)
+      // Complete Sentence 3 -> all 3 spoken in strict chronological order!
+      ttsOnDone?.invoke(tts3Id)
       assertFalse(voiceBridge.state.value.isTtsSpeaking)
       assertEquals(
         listOf(
           "【中譯】Beacon handover latency is 12 ms." to "zh-TW",
-          "[EN] 收到，應答器延遲符合規範。" to "en-US",
+          "【中譯】Please confirm emergency brake distance." to "zh-TW",
+          "[EN] 收到，應答器延遲與緊急煞車距離均符合規範。" to "en-US",
         ),
         voiceBridge.state.value.completedSpeechHistory,
       )
@@ -610,21 +668,42 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
    * Verifies:
    * 1. When the very first Firestore write (`addUtterance`) fails, the error state accurately
    *    states `"無法儲存逐字稿（原文尚未寫入雲端）"` and NEVER falsely claims `"原文已保存至逐字稿"`.
-   * 2. Multi-device safety: When Phone A (`viewModelA`) and Phone B (`viewModelB`) are both viewing
-   *    the same session, Phone B observing Phone A's in-flight `"⏳ [口譯處理中...]"` utterance
-   *    does NOT overwrite it as failed in Firestore while Phone A is still translating.
-   * 3. Reopen retry: When the app is reopened (`reopenedViewModel`) and an utterance is stuck in
-   *    `"⏳ [口譯處理中...]"`, `canRetryTranslation` is immediately `true` so the user can retry it.
+   * 2. Multi-device safety (both automatic AND manual retry within 65s + transactional protection):
+   *    - While Phone A (`phoneAViewModel`) is actively translating a fresh utterance (< 65s old),
+   *      Phone B (`phoneBViewModel`, which has its own separate `PendingTranslationStore`) sees
+   *      `canRetryTranslation == false` and even if `phoneBViewModel.retryTranslateUtterance(...)`
+   *      is called directly, it is blocked so Phone B cannot concurrently translate or overwrite Phone A!
+   *    - Once Phone A writes the completed translation, calling `markUtteranceFailedIfStillPending`
+   *      in a transaction returns `false` and NEVER overwrites Phone A's completed translation!
+   * 3. Same-device reopen retry via `SharedPreferences`:
+   *    - When an utterance was recorded as in-flight in `SharedPrefsPendingTranslationStore` on
+   *      Phone A before app termination, reopening Phone A (`reopenedViewModel`) loads
+   *      `localInterruptedUtteranceIds` from `SharedPreferences`, so `canRetryTranslation` is
+   *      immediately `true` without waiting 65 seconds!
    */
   @Test
   fun initialWriteFailureAndOrphanedPendingUtterance_reportsAccurateErrorAndAllowsRetry() =
     runBlocking {
       val aliceUid = signInTestUser(ALICE_EMAIL)
-      val repository = MetroVoiceRepository(firestore)
+      val context = ApplicationProvider.getApplicationContext<Context>()
+      context
+        .getSharedPreferences(SharedPrefsPendingTranslationStore.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .clear()
+        .commit()
+
+      // Phone A uses the default SharedPreferences-backed repository; Phone B has its own store
+      val phoneARepository = MetroVoiceRepository(firestore)
+      val phoneBRepository =
+        MetroVoiceRepository(
+          db = firestore,
+          pendingDeleteStore = InMemoryPendingDeleteSessionStore(),
+          pendingTranslationStore = InMemoryPendingTranslationStore(),
+        )
 
       val viewModel =
         MetroVoiceViewModel(
-          repository = repository,
+          repository = phoneARepository,
           currentUserId = aliceUid,
           autoSeedOnEmpty = false,
           customTranslationGenerator = { _, _, _ ->
@@ -666,7 +745,7 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       // Part B: Multi-device safety — Phone A is actively translating while Phone B is observing
       val validSessionId =
         withTimeout(DEFAULT_TIMEOUT_MS) {
-          repository.createSession(
+          phoneARepository.createSession(
             title = "Multi-Device & Reopen Session",
             metroLine = "環狀線 (Y)",
             testCategory = "CBTC",
@@ -675,21 +754,28 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
           )
         }
       val validSession =
-        withTimeout(DEFAULT_TIMEOUT_MS) { repository.getSessionById(aliceUid, validSessionId)!! }
+        withTimeout(DEFAULT_TIMEOUT_MS) {
+          phoneARepository.getSessionById(aliceUid, validSessionId)!!
+        }
 
       val phoneATranslationGate = CompletableDeferred<String>()
+      var phoneBTranslationCalled = false
       val phoneAViewModel =
         MetroVoiceViewModel(
-          repository = repository,
+          repository = phoneARepository,
           currentUserId = aliceUid,
           autoSeedOnEmpty = false,
           customTranslationGenerator = { _, _, _ -> phoneATranslationGate.await() },
         )
       val phoneBViewModel =
         MetroVoiceViewModel(
-          repository = repository,
+          repository = phoneBRepository,
           currentUserId = aliceUid,
           autoSeedOnEmpty = false,
+          customTranslationGenerator = { _, _, _ ->
+            phoneBTranslationCalled = true
+            """{"translatedText": "手機 B 不應覆蓋的譯文", "technicalTerms": []}"""
+          },
         )
       phoneAViewModel.selectSession(validSessionId)
       phoneBViewModel.selectSession(validSessionId)
@@ -702,7 +788,7 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
         onSpeakTranslationReady = { _, _ -> },
       )
 
-      // Phone B observes the pending utterance while Phone A is still translating
+      // Phone B observes the pending utterance while Phone A is still translating (< 65s old)
       val pendingSeenByPhoneB =
         withTimeout(FLOW_TIMEOUT_MS) {
           phoneBViewModel.utterancesState
@@ -717,25 +803,62 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
         pendingSeenByPhoneB.isTranslationPending(),
       )
       assertFalse(
-        "Phone B must NOT corrupt Phone A's active translation into failed state",
-        pendingSeenByPhoneB.isTranslationFailed(),
+        "Phone B must NOT allow manual retry on Phone A's live (< 65s) translation",
+        pendingSeenByPhoneB.canRetryTranslation(
+          activeTranslatingIds = phoneBViewModel.activeTranslatingUtteranceIds.value,
+          localInterruptedIds = phoneBViewModel.localInterruptedUtteranceIds.value,
+        ),
+      )
+
+      // Even if Phone B invokes retryTranslateUtterance directly, it must be ignored!
+      phoneBViewModel.retryTranslateUtterance(
+        session = validSession,
+        utterance = pendingSeenByPhoneB,
+        onSpeakTranslationReady = { _, _ -> },
+      )
+      assertFalse(
+        "Phone B must not run concurrent AI translation while Phone A is still within 65s window",
+        phoneBTranslationCalled,
       )
 
       // Now Phone A finishes translating -> both devices see the completed translation!
       phoneATranslationGate.complete(
         """{"translatedText": "手機 A 順利完成的中文譯文。", "technicalTerms": []}"""
       )
-      withTimeout(FLOW_TIMEOUT_MS) {
-        phoneBViewModel.utterancesState.first { state ->
-          state is DataUiState.Success &&
-            state.data.any { it.translatedText == "手機 A 順利完成的中文譯文。" }
+      val completedOnPhoneB =
+        withTimeout(FLOW_TIMEOUT_MS) {
+          phoneBViewModel.utterancesState
+            .first { state ->
+              state is DataUiState.Success &&
+                state.data.any { it.translatedText == "手機 A 順利完成的中文譯文。" }
+            }
+            .let { (it as DataUiState.Success).data.first() }
         }
+      withTimeout(FLOW_TIMEOUT_MS) {
+        phoneAViewModel.aiTaskState.first { it is AiTaskState.Idle }
       }
 
-      // Part C: Simulate an utterance saved with PENDING_TRANSLATION_PLACEHOLDER before app termination
+      // Verify transactional protection: if a late stale timeout tries to mark the utterance failed
+      // AFTER Phone A already wrote the completed translation, the transaction refuses to overwrite!
+      val overwrittenByLateTimeout =
+        withTimeout(DEFAULT_TIMEOUT_MS) {
+          phoneBRepository.markUtteranceFailedIfStillPending(
+            userId = aliceUid,
+            sessionId = validSessionId,
+            utteranceId = completedOnPhoneB.id,
+            failedText = "⚠️ [口譯中斷或逾時，請點擊重試]",
+          )
+        }
+      assertFalse(
+        "markUtteranceFailedIfStillPending must return false when translation is already completed",
+        overwrittenByLateTimeout,
+      )
+
+      // Part C: Simulate an utterance saved on Phone A with PENDING_TRANSLATION_PLACEHOLDER and
+      // recorded in Phone A's SharedPreferences before app termination
       val stuckUtteranceId =
         withTimeout(DEFAULT_TIMEOUT_MS) {
-          repository.addUtterance(
+          phoneARepository.addUtterance(
             sessionId = validSessionId,
             speakerRole = "FOREIGN_ENGINEER",
             speakerLabel = "外籍技師",
@@ -746,10 +869,13 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
             technicalTerms = emptyList(),
           )
         }
+      phoneARepository.markInFlightTranslation(aliceUid, stuckUtteranceId)
 
+      // Create a brand-new MetroVoiceRepository(firestore) to simulate process restart reading SharedPreferences
+      val reopenedRepository = MetroVoiceRepository(firestore)
       val reopenedViewModel =
         MetroVoiceViewModel(
-          repository = repository,
+          repository = reopenedRepository,
           currentUserId = aliceUid,
           autoSeedOnEmpty = false,
           customTranslationGenerator = { _, _, _ ->
@@ -767,9 +893,10 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
             .let { (it as DataUiState.Success).data.first { u -> u.id == stuckUtteranceId } }
         }
       assertTrue(
-        "Stuck pending utterance on reopen must allow retry via canRetryTranslation",
+        "Stuck pending utterance on reopen must allow immediate retry via SharedPreferences localInterruptedUtteranceIds",
         stuckUtteranceOnReopen.canRetryTranslation(
-          reopenedViewModel.activeTranslatingUtteranceIds.value
+          activeTranslatingIds = reopenedViewModel.activeTranslatingUtteranceIds.value,
+          localInterruptedIds = reopenedViewModel.localInterruptedUtteranceIds.value,
         ),
       )
 
@@ -781,7 +908,7 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       )
 
       withTimeout(FLOW_TIMEOUT_MS) {
-        repository.observeUtterances(aliceUid, validSessionId).first { list ->
+        reopenedRepository.observeUtterances(aliceUid, validSessionId).first { list ->
           list.any {
             it.id == stuckUtteranceId && it.translatedText == "程序重啟後成功補譯的中文譯文。"
           }
@@ -798,15 +925,24 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
    * 1. Deleting a session deletes the parent session first (blocking concurrent writes via
    *    `firestore.rules`) and drains all child `utterances` in a loop.
    * 2. If the app process is terminated AFTER the parent session document is deleted—while
-   *    child `utterances` have not finished being deleted—the durable `PendingDeleteSessionStore`
-   *    retains the `sessionId`, and on restart (`observeSessions` / `resumePendingSessionDeletions`)
-   *    automatically resumes and purges all remaining child `utterances`!
+   *    child `utterances` have not finished being deleted—both `MetroVoiceRepository(context, firestore)`
+   *    (used by `MainActivity`) and `MetroVoiceRepository(firestore)` persist the pending `sessionId`
+   *    to real Android `SharedPreferences`, and a brand-new `MetroVoiceRepository` instance
+   *    (with NO shared in-memory object) reads `SharedPreferences` on restart (`observeSessions`)
+   *    and purges all remaining child `utterances`!
    */
   @Test
   fun deleteSession_deletesChildUtterancesSubcollectionAndBlocksConcurrentWrites() = runBlocking {
     val aliceUid = signInTestUser(ALICE_EMAIL)
-    val sharedPendingDeleteStore = InMemoryPendingDeleteSessionStore()
-    val repository = MetroVoiceRepository(firestore, sharedPendingDeleteStore)
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    context
+      .getSharedPreferences(SharedPrefsPendingDeleteSessionStore.PREFS_NAME, Context.MODE_PRIVATE)
+      .edit()
+      .clear()
+      .commit()
+
+    // Use the exact 1-arg constructor MetroVoiceRepository(firestore) backed by real SharedPreferences!
+    val repository = MetroVoiceRepository(firestore)
 
     val sessionId =
       withTimeout(DEFAULT_TIMEOUT_MS) {
@@ -877,9 +1013,12 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       "Concurrent utterance creation after parent session delete must be rejected",
       postParentDeleteWriteRejected,
     )
+
+    // Verify a brand-new SharedPrefsPendingDeleteSessionStore(context) sees the persisted sessionId
+    val freshPrefsInspector = SharedPrefsPendingDeleteSessionStore(context)
     assertTrue(
-      "Interrupted session deletion must remain recorded in PendingDeleteSessionStore",
-      sharedPendingDeleteStore.getPendingDeleteSessionIds(aliceUid).contains(sessionId),
+      "Interrupted session deletion must be persisted in real Android SharedPreferences",
+      freshPrefsInspector.getPendingDeleteSessionIds(aliceUid).contains(sessionId),
     )
 
     // Utterances are still in Firestore prior to restart resume
@@ -887,13 +1026,13 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       withTimeout(FLOW_TIMEOUT_MS) { repository.observeUtterances(aliceUid, sessionId).first() }
     assertEquals(2, remainingBeforeResume.size)
 
-    // Simulate app restart with a new Repository instance sharing the durable PendingDeleteSessionStore
-    val restartedRepository = MetroVoiceRepository(firestore, sharedPendingDeleteStore)
+    // Simulate app restart with a brand-new MetroVoiceRepository(firestore) instance (no shared memory!)
+    val restartedRepository = MetroVoiceRepository(firestore)
     withTimeout(FLOW_TIMEOUT_MS) {
       restartedRepository.observeSessions(aliceUid).first()
     }
 
-    // Verify restart automatically resumed and wiped all leftover child utterances!
+    // Verify restart automatically resumed from SharedPreferences and wiped all leftover child utterances!
     val afterResumeUtterances =
       withTimeout(FLOW_TIMEOUT_MS) {
         restartedRepository.observeUtterances(aliceUid, sessionId).first()
@@ -903,8 +1042,8 @@ class MetroVoiceRepositoryRuleTest : FirestoreEmulatorTestBase() {
       afterResumeUtterances.isEmpty(),
     )
     assertTrue(
-      "PendingDeleteSessionStore must be cleared once cleanup completes",
-      sharedPendingDeleteStore.getPendingDeleteSessionIds(aliceUid).isEmpty(),
+      "SharedPreferences pending delete set must be cleared once cleanup completes",
+      freshPrefsInspector.getPendingDeleteSessionIds(aliceUid).isEmpty(),
     )
   }
 

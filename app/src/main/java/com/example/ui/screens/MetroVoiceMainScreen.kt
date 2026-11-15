@@ -117,6 +117,7 @@ fun MetroVoiceMainScreen(
   val autoSpeak by viewModel.autoSpeakTranslation.collectAsStateWithLifecycle()
   val spotlightUtterance by viewModel.spotlightUtterance.collectAsStateWithLifecycle()
   val activeTranslatingIds by viewModel.activeTranslatingUtteranceIds.collectAsStateWithLifecycle()
+  val localInterruptedIds by viewModel.localInterruptedUtteranceIds.collectAsStateWithLifecycle()
 
   var activeTabIndex by remember { mutableIntStateOf(0) }
   var showCreateSessionDialog by remember { mutableStateOf(false) }
@@ -357,6 +358,7 @@ fun MetroVoiceMainScreen(
                   foreignLang = currentForeignLangOption,
                   utterances = utterances,
                   activeTranslatingIds = activeTranslatingIds,
+                  localInterruptedIds = localInterruptedIds,
                   activeListeningChannel = voiceState.activeChannel,
                   isFinalizingSpeech = voiceState.isFinalizingSpeech,
                   partialSpeechText = voiceState.partialTranscript,
@@ -432,6 +434,7 @@ fun MetroVoiceMainScreen(
               foreignLang = currentForeignLangOption,
               utterances = utterances,
               activeTranslatingIds = activeTranslatingIds,
+              localInterruptedIds = localInterruptedIds,
               activeListeningChannel = voiceState.activeChannel,
               isFinalizingSpeech = voiceState.isFinalizingSpeech,
               partialSpeechText = voiceState.partialTranscript,
@@ -692,6 +695,7 @@ private fun LiveInterpreterPane(
   foreignLang: ForeignLanguageOption,
   utterances: List<Utterance>,
   activeTranslatingIds: Set<String>,
+  localInterruptedIds: Set<String>,
   activeListeningChannel: ListeningChannel,
   isFinalizingSpeech: Boolean,
   partialSpeechText: String,
@@ -791,6 +795,7 @@ private fun LiveInterpreterPane(
         UtteranceBilingualCard(
           utterance = utterance,
           activeTranslatingIds = activeTranslatingIds,
+          localInterruptedIds = localInterruptedIds,
           onSpeakText = onSpeakText,
           onTogglePin = onTogglePin,
           onOpenSpotlight = onOpenSpotlight,
