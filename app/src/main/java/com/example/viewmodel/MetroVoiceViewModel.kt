@@ -33,6 +33,15 @@ import org.json.JSONObject
 
 private const val TAG = "MetroVoiceVM"
 
+const val PENDING_TRANSLATION_PLACEHOLDER = "⏳ [口譯處理中...]"
+const val FAILED_TRANSLATION_PREFIX = "⚠️ [翻譯失敗，請點擊重試]"
+
+fun Utterance.isTranslationPending(): Boolean =
+  translatedText.startsWith("⏳")
+
+fun Utterance.isTranslationFailed(): Boolean =
+  translatedText.startsWith("⚠️")
+
 sealed interface DataUiState<out T> {
   data object Loading : DataUiState<Nothing>
   data class Success<T>(val data: T) : DataUiState<T>
@@ -49,6 +58,10 @@ sealed interface AiTaskState {
 class MetroVoiceViewModel(
   private val repository: MetroVoiceRepository,
   private val currentUserId: String,
+  private val autoSeedOnEmpty: Boolean = true,
+  private val customTranslationGenerator:
+    (suspend (session: TestSession, speakerRole: String, spokenText: String) -> String)? =
+    null,
 ) : ViewModel() {
 
   private val translationSchema =
@@ -138,7 +151,7 @@ class MetroVoiceViewModel(
     repository
       .observeSessions(currentUserId)
       .map<List<TestSession>, DataUiState<List<TestSession>>> { list ->
-        if (list.isEmpty() && !hasSeededInitialSession) {
+        if (list.isEmpty() && autoSeedOnEmpty && !hasSeededInitialSession) {
           hasSeededInitialSession = true
           seedDefaultMrtSession()
         } else if (list.isNotEmpty() && _selectedSessionId.value == null) {
@@ -347,9 +360,84 @@ class MetroVoiceViewModel(
   }
 
   /**
+   * Parses and strictly validates the structured JSON returned by the translation model.
+   * Rejects blank or missing `translatedText` with [IllegalStateException] instead of
+   * silently falling back to the original source text.
+   */
+  internal fun parseAndValidateTranslationJson(jsonString: String): TranslationResult {
+    val json = JSONObject(jsonString)
+    val translatedText = json.optString("translatedText", "").trim()
+    if (translatedText.isEmpty()) {
+      throw IllegalStateException("AI 模型回傳空白譯文，請點擊重試翻譯。")
+    }
+    val termsJsonArray = json.optJSONArray("technicalTerms")
+    val terms =
+      if (termsJsonArray != null) {
+        (0 until termsJsonArray.length()).mapNotNull { idx ->
+          termsJsonArray.optString(idx)?.takeIf { it.isNotBlank() }
+        }
+      } else {
+        emptyList()
+      }
+    return TranslationResult(translatedText = translatedText, technicalTerms = terms)
+  }
+
+  private suspend fun executeAiTranslation(
+    session: TestSession,
+    speakerRole: String,
+    cleanInput: String,
+  ): TranslationResult {
+    val isForeignSpeaker = speakerRole == "FOREIGN_ENGINEER"
+    val directionPrompt =
+      if (isForeignSpeaker) {
+        """
+        You are a real-time professional MRT / Metro Railway Testing & Commissioning Interpreter.
+        Context:
+        - Metro Line: ${session.metroLine}
+        - Test Category: ${session.testCategory}
+        - Foreign Engineer Language: ${session.foreignLangLabel} (${session.foreignLangCode})
+        Task:
+        1. Translate the foreign engineer's statement below into natural, accurate Traditional Chinese (繁體中文, Taiwan MRT engineering terminology such as 號誌、聯鎖、轉轍器、月台門 PSD、列車自動保護 ATP、車載控制器 VOBC、轉向架).
+        2. Extract up to 4 technical railway terms mentioned and provide brief bilingual explanations in the format "Original Term: 繁體中文專業術語".
+
+        Statement to translate:
+        "$cleanInput"
+        """.trimIndent()
+      } else {
+        """
+        You are a real-time professional MRT / Metro Railway Testing & Commissioning Interpreter.
+        Context:
+        - Metro Line: ${session.metroLine}
+        - Test Category: ${session.testCategory}
+        - Target Foreign Language: ${session.foreignLangLabel} (${session.foreignLangCode})
+        Task:
+        1. Reverse-translate the Taiwan MRT engineer's statement below from Traditional Chinese into clear, professional, idiomatic ${session.foreignLangLabel} (${session.foreignLangCode}) so the foreign railway engineer immediately understands the instruction or test observation.
+        2. Extract up to 4 technical railway terms mentioned and provide brief bilingual glosses in the format "Target Term: 繁體中文專業術語".
+
+        Statement to translate:
+        "$cleanInput"
+        """.trimIndent()
+      }
+
+    val jsonString =
+      if (customTranslationGenerator != null) {
+        withTimeout(60_000L) {
+          customTranslationGenerator.invoke(session, speakerRole, cleanInput)
+        }
+      } else {
+        val response = withTimeout(60_000L) { translationModel.generateContent(directionPrompt) }
+        response.text ?: throw IllegalStateException("AI 模型回傳空白回應，請點擊重試翻譯。")
+      }
+
+    return parseAndValidateTranslationJson(jsonString)
+  }
+
+  /**
    * Bidirectional Real-Time Translation via Firebase AI Logic (Gemini 3.8 Flash):
-   * - If speakerRole == "FOREIGN_ENGINEER": Translates Foreign Language -> Traditional Chinese (zh-TW)
-   * - If speakerRole == "LOCAL_ENGINEER": Reverse-translates Traditional Chinese -> Foreign Language
+   * 1. Immediately persists the recognized [spokenText] (`originalText`) to Firestore so
+   *    the user's spoken words are NEVER lost even if network/AI translation fails.
+   * 2. Translates the utterance and updates the saved Firestore document.
+   * 3. Automatically triggers [onSpeakTranslationReady] when `_autoSpeakTranslation` is enabled.
    */
   fun translateAndRecordUtterance(
     session: TestSession,
@@ -372,84 +460,133 @@ class MetroVoiceViewModel(
 
     viewModelScope.launch {
       _aiTaskState.value = AiTaskState.Translating(speakerRole, cleanInput)
+      var savedUtteranceId: String? = null
       try {
-        val directionPrompt =
-          if (isForeignSpeaker) {
-            """
-            You are a real-time professional MRT / Metro Railway Testing & Commissioning Interpreter.
-            Context:
-            - Metro Line: ${session.metroLine}
-            - Test Category: ${session.testCategory}
-            - Foreign Engineer Language: ${session.foreignLangLabel} (${session.foreignLangCode})
-            Task:
-            1. Translate the foreign engineer's statement below into natural, accurate Traditional Chinese (繁體中文, Taiwan MRT engineering terminology such as 號誌、聯鎖、轉轍器、月台門 PSD、列車自動保護 ATP、車載控制器 VOBC、轉向架).
-            2. Extract up to 4 technical railway terms mentioned and provide brief bilingual explanations in the format "Original Term: 繁體中文專業術語".
+        // Step 1: Immediately save recognized originalText to Firestore so it is never lost
+        savedUtteranceId =
+          repository.addUtterance(
+            sessionId = session.id,
+            speakerRole = speakerRole,
+            speakerLabel = speakerLabel,
+            sourceLang = sourceLang,
+            targetLang = targetLang,
+            originalText = cleanInput,
+            translatedText = PENDING_TRANSLATION_PLACEHOLDER,
+            technicalTerms = emptyList(),
+            isPinnedToMinutes = false,
+          )
 
-            Statement to translate:
-            "$cleanInput"
-            """.trimIndent()
-          } else {
-            """
-            You are a real-time professional MRT / Metro Railway Testing & Commissioning Interpreter.
-            Context:
-            - Metro Line: ${session.metroLine}
-            - Test Category: ${session.testCategory}
-            - Target Foreign Language: ${session.foreignLangLabel} (${session.foreignLangCode})
-            Task:
-            1. Reverse-translate the Taiwan MRT engineer's statement below from Traditional Chinese into clear, professional, idiomatic ${session.foreignLangLabel} (${session.foreignLangCode}) so the foreign railway engineer immediately understands the instruction or test observation.
-            2. Extract up to 4 technical railway terms mentioned and provide brief bilingual glosses in the format "Target Term: 繁體中文專業術語".
+        // Step 2: Run AI translation and validate non-blank translatedText
+        val result = executeAiTranslation(session, speakerRole, cleanInput)
 
-            Statement to translate:
-            "$cleanInput"
-            """.trimIndent()
-          }
-
-        val response = withTimeout(60_000L) { translationModel.generateContent(directionPrompt) }
-        val jsonString =
-          response.text ?: throw IllegalStateException("AI 模型回傳空白翻譯結果，請再試一次。")
-
-        val json = JSONObject(jsonString)
-        val translatedText = json.optString("translatedText", "").trim().ifEmpty { cleanInput }
-        val termsJsonArray = json.optJSONArray("technicalTerms")
-        val terms =
-          if (termsJsonArray != null) {
-            (0 until termsJsonArray.length()).mapNotNull { idx ->
-              termsJsonArray.optString(idx)?.takeIf { it.isNotBlank() }
-            }
-          } else {
-            emptyList()
-          }
-
-        val result = TranslationResult(translatedText = translatedText, technicalTerms = terms)
-
-        repository.addUtterance(
-          sessionId = session.id,
-          speakerRole = speakerRole,
-          speakerLabel = speakerLabel,
-          sourceLang = sourceLang,
-          targetLang = targetLang,
-          originalText = cleanInput,
-          translatedText = result.translatedText,
-          technicalTerms = result.technicalTerms,
-          isPinnedToMinutes = false,
-        )
-
-        _aiTaskState.value = AiTaskState.Idle
-
+        // Step 3: Trigger TTS playback immediately so there is zero extra latency after translation
         if (_autoSpeakTranslation.value) {
           onSpeakTranslationReady(result.translatedText, targetLang)
         }
+
+        // Step 4: Update saved utterance with verified translation and extracted terms
+        repository.updateUtteranceTranslation(
+          userId = currentUserId,
+          sessionId = session.id,
+          utteranceId = savedUtteranceId,
+          translatedText = result.translatedText,
+          technicalTerms = result.technicalTerms,
+        )
+
+        _aiTaskState.value = AiTaskState.Idle
       } catch (e: TimeoutCancellationException) {
         Log.e(TAG, "Translation timed out", e)
-        _aiTaskState.value = AiTaskState.Error("即時口譯逾時（超過 60 秒），請檢查網路連線後重試。")
+        markUtteranceTranslationFailed(session.id, savedUtteranceId, "連線逾時")
+        _aiTaskState.value =
+          AiTaskState.Error("即時口譯逾時（原文已保存至逐字稿，可直接點擊該句「重試翻譯」）。")
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
         Log.e(TAG, "Firebase AI translation failed", e)
+        markUtteranceTranslationFailed(
+          session.id,
+          savedUtteranceId,
+          e.localizedMessage ?: "翻譯失敗",
+        )
         _aiTaskState.value =
-          AiTaskState.Error("即時口譯失敗：${e.localizedMessage ?: "請確認網路或稍後再試"}")
+          AiTaskState.Error(
+            "即時口譯失敗：${e.localizedMessage ?: "請稍後再試"}（原文已保存至逐字稿，可點擊「重試翻譯」）"
+          )
       }
     }
+  }
+
+  /**
+   * Retries AI translation for an already-persisted [Utterance] whose initial translation
+   * failed or timed out, updating it in place and speaking the result if auto-speak is enabled.
+   */
+  fun retryTranslateUtterance(
+    session: TestSession,
+    utterance: Utterance,
+    onSpeakTranslationReady: (textToSpeak: String, languageTag: String) -> Unit,
+  ) {
+    if (utterance.id.isBlank() || utterance.originalText.isBlank()) return
+
+    viewModelScope.launch {
+      _aiTaskState.value = AiTaskState.Translating(utterance.speakerRole, utterance.originalText)
+      try {
+        repository.updateUtteranceTranslation(
+          userId = currentUserId,
+          sessionId = utterance.sessionId,
+          utteranceId = utterance.id,
+          translatedText = PENDING_TRANSLATION_PLACEHOLDER,
+          technicalTerms = utterance.technicalTerms,
+        )
+
+        val result = executeAiTranslation(session, utterance.speakerRole, utterance.originalText)
+
+        if (_autoSpeakTranslation.value) {
+          onSpeakTranslationReady(result.translatedText, utterance.targetLang)
+        }
+
+        repository.updateUtteranceTranslation(
+          userId = currentUserId,
+          sessionId = utterance.sessionId,
+          utteranceId = utterance.id,
+          translatedText = result.translatedText,
+          technicalTerms = result.technicalTerms,
+        )
+
+        _aiTaskState.value = AiTaskState.Idle
+      } catch (e: TimeoutCancellationException) {
+        Log.e(TAG, "Retry translation timed out", e)
+        markUtteranceTranslationFailed(utterance.sessionId, utterance.id, "連線逾時")
+        _aiTaskState.value = AiTaskState.Error("重試口譯逾時，請檢查網路連線後再試一次。")
+      } catch (e: CancellationException) {
+        throw e
+      } catch (e: Exception) {
+        Log.e(TAG, "Retry translation failed", e)
+        markUtteranceTranslationFailed(
+          utterance.sessionId,
+          utterance.id,
+          e.localizedMessage ?: "翻譯失敗",
+        )
+        _aiTaskState.value =
+          AiTaskState.Error("重試口譯失敗：${e.localizedMessage ?: "請稍後再試"}")
+      }
+    }
+  }
+
+  private suspend fun markUtteranceTranslationFailed(
+    sessionId: String,
+    utteranceId: String?,
+    reason: String,
+  ) {
+    if (utteranceId.isNullOrBlank()) return
+    try {
+      repository.updateUtteranceTranslation(
+        userId = currentUserId,
+        sessionId = sessionId,
+        utteranceId = utteranceId,
+        translatedText = "$FAILED_TRANSLATION_PREFIX（$reason）",
+        technicalTerms = emptyList(),
+      )
+    } catch (_: Exception) {}
   }
 
   /**
@@ -472,10 +609,16 @@ class MetroVoiceViewModel(
         val transcriptBuilder = StringBuilder()
         utterances.forEachIndexed { index, utt ->
           val pinTag = if (utt.isPinnedToMinutes) "[★重點標記] " else ""
+          val translationLine =
+            if (utt.isTranslationFailed() || utt.isTranslationPending()) {
+              "（譯文待補，請依據原文彙整）"
+            } else {
+              utt.translatedText
+            }
           transcriptBuilder.append(
             "${index + 1}. $pinTag[${utt.speakerLabel}]\n" +
               "   原文 (${utt.sourceLang}): ${utt.originalText}\n" +
-              "   譯文 (${utt.targetLang}): ${utt.translatedText}\n"
+              "   譯文 (${utt.targetLang}): $translationLine\n"
           )
         }
 

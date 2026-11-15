@@ -29,13 +29,14 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.RecordVoiceOver
-import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -62,7 +63,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -76,6 +76,8 @@ import com.example.data.model.SUPPORTED_FOREIGN_LANGUAGES
 import com.example.data.model.TEST_CATEGORIES
 import com.example.data.model.Utterance
 import com.example.speech.ListeningChannel
+import com.example.viewmodel.isTranslationFailed
+import com.example.viewmodel.isTranslationPending
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -83,11 +85,13 @@ import java.util.Locale
 fun DualChannelControlDeck(
   foreignLang: ForeignLanguageOption,
   activeListeningChannel: ListeningChannel,
+  isFinalizingSpeech: Boolean,
   partialSpeechText: String,
   isAiTranslating: Boolean,
   translatingPreview: String,
   onStartVoiceChannel: (ListeningChannel) -> Unit,
-  onStopVoiceChannel: () -> Unit,
+  onFinishVoiceChannel: () -> Unit,
+  onCancelVoiceChannel: () -> Unit,
   onSubmitStatement: (speakerRole: String, text: String) -> Unit,
 ) {
   var selectedInputChannel by remember { mutableStateOf("FOREIGN_ENGINEER") }
@@ -145,12 +149,12 @@ fun DualChannelControlDeck(
             ),
           modifier =
             Modifier.weight(1f)
-              .scale(if (isForeignListening) pulseScale else 1f)
+              .scale(if (isForeignListening && !isFinalizingSpeech) pulseScale else 1f)
               .clip(RoundedCornerShape(18.dp))
               .clickable {
                 selectedInputChannel = "FOREIGN_ENGINEER"
                 if (isForeignListening) {
-                  onStopVoiceChannel()
+                  onFinishVoiceChannel()
                 } else {
                   onStartVoiceChannel(ListeningChannel.FOREIGN_TO_LOCAL)
                 }
@@ -166,7 +170,7 @@ fun DualChannelControlDeck(
               horizontalArrangement = Arrangement.Center,
             ) {
               Icon(
-                imageVector = if (isForeignListening) Icons.Default.Stop else Icons.Default.Mic,
+                imageVector = if (isForeignListening) Icons.Default.Check else Icons.Default.Mic,
                 contentDescription = "外籍技師語音收音",
                 tint =
                   if (isForeignListening) {
@@ -191,7 +195,12 @@ fun DualChannelControlDeck(
             }
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-              text = if (isForeignListening) "點擊停止收音" else "外籍技師講話",
+              text =
+                when {
+                  isForeignListening && isFinalizingSpeech -> "正在完成辨識..."
+                  isForeignListening -> "講完送出辨識"
+                  else -> "外籍技師講話"
+                },
               style = MaterialTheme.typography.titleMedium,
               fontWeight = FontWeight.Bold,
               color =
@@ -231,12 +240,12 @@ fun DualChannelControlDeck(
             ),
           modifier =
             Modifier.weight(1f)
-              .scale(if (isLocalListening) pulseScale else 1f)
+              .scale(if (isLocalListening && !isFinalizingSpeech) pulseScale else 1f)
               .clip(RoundedCornerShape(18.dp))
               .clickable {
                 selectedInputChannel = "LOCAL_ENGINEER"
                 if (isLocalListening) {
-                  onStopVoiceChannel()
+                  onFinishVoiceChannel()
                 } else {
                   onStartVoiceChannel(ListeningChannel.LOCAL_TO_FOREIGN)
                 }
@@ -253,7 +262,7 @@ fun DualChannelControlDeck(
             ) {
               Icon(
                 imageVector =
-                  if (isLocalListening) Icons.Default.Stop else Icons.Default.RecordVoiceOver,
+                  if (isLocalListening) Icons.Default.Check else Icons.Default.RecordVoiceOver,
                 contentDescription = "我方工程師語音收音",
                 tint =
                   if (isLocalListening) {
@@ -278,7 +287,12 @@ fun DualChannelControlDeck(
             }
             Spacer(modifier = Modifier.height(6.dp))
             Text(
-              text = if (isLocalListening) "點擊停止收音" else "我方講話反譯",
+              text =
+                when {
+                  isLocalListening && isFinalizingSpeech -> "正在完成辨識..."
+                  isLocalListening -> "講完送出辨識"
+                  else -> "我方講話反譯"
+                },
               style = MaterialTheme.typography.titleMedium,
               fontWeight = FontWeight.Bold,
               color =
@@ -303,7 +317,7 @@ fun DualChannelControlDeck(
         }
       }
 
-      // Live Speech / AI Translation Status Banner
+      // Live Speech / AI Translation Status Banner with Separate Finish vs Cancel Controls
       AnimatedVisibility(
         visible = activeListeningChannel != ListeningChannel.NONE || isAiTranslating
       ) {
@@ -328,6 +342,7 @@ fun DualChannelControlDeck(
                 text =
                   when {
                     isAiTranslating -> "Gemini AI 正在進行軌道專業雙向口譯..."
+                    isFinalizingSpeech -> "正在完成語音辨識並送出..."
                     isForeignListening -> "正在收聽外籍技師 (${foreignLang.label})..."
                     else -> "正在收聽我方工程師 (繁體中文)..."
                   },
@@ -345,6 +360,14 @@ fun DualChannelControlDeck(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface,
               )
+            }
+            if (activeListeningChannel != ListeningChannel.NONE) {
+              TextButton(
+                onClick = onCancelVoiceChannel,
+                modifier = Modifier.testTag("cancel_voice_channel_btn"),
+              ) {
+                Text("取消收音", color = MaterialTheme.colorScheme.error)
+              }
             }
           }
         }
@@ -513,19 +536,23 @@ fun UtteranceBilingualCard(
   onSpeakText: (text: String, langTag: String) -> Unit,
   onTogglePin: (Utterance) -> Unit,
   onOpenSpotlight: (Utterance) -> Unit,
+  onRetryTranslation: (Utterance) -> Unit,
 ) {
   val isForeignSpeaker = utterance.speakerRole == "FOREIGN_ENGINEER"
+  val isFailed = utterance.isTranslationFailed()
+  val isPending = utterance.isTranslationPending()
+
   val accentColor =
-    if (isForeignSpeaker) {
-      MaterialTheme.colorScheme.primary
-    } else {
-      MaterialTheme.colorScheme.secondary
+    when {
+      isFailed -> MaterialTheme.colorScheme.error
+      isForeignSpeaker -> MaterialTheme.colorScheme.primary
+      else -> MaterialTheme.colorScheme.secondary
     }
   val containerBg =
-    if (isForeignSpeaker) {
-      MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.32f)
-    } else {
-      MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.32f)
+    when {
+      isFailed -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.28f)
+      isForeignSpeaker -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.32f)
+      else -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.32f)
     }
 
   val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
@@ -537,9 +564,9 @@ fun UtteranceBilingualCard(
     colors = CardDefaults.cardColors(containerColor = containerBg),
     border =
       BorderStroke(
-        width = if (utterance.isPinnedToMinutes) 1.5.dp else 1.dp,
+        width = if (utterance.isPinnedToMinutes || isFailed) 1.5.dp else 1.dp,
         color =
-          if (utterance.isPinnedToMinutes) {
+          if (utterance.isPinnedToMinutes || isFailed) {
             accentColor
           } else {
             accentColor.copy(alpha = 0.35f)
@@ -575,27 +602,29 @@ fun UtteranceBilingualCard(
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
-          IconButton(
-            onClick = { onSpeakText(utterance.translatedText, utterance.targetLang) },
-            modifier = Modifier.size(36.dp).testTag("speak_translation_btn_${utterance.id}"),
-          ) {
-            Icon(
-              imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-              contentDescription = "朗讀翻譯結果",
-              tint = accentColor,
-              modifier = Modifier.size(20.dp),
-            )
-          }
-          IconButton(
-            onClick = { onOpenSpotlight(utterance) },
-            modifier = Modifier.size(36.dp).testTag("spotlight_btn_${utterance.id}"),
-          ) {
-            Icon(
-              imageVector = Icons.Default.Fullscreen,
-              contentDescription = "放大顯示給對方看",
-              tint = MaterialTheme.colorScheme.onSurfaceVariant,
-              modifier = Modifier.size(20.dp),
-            )
+          if (!isFailed && !isPending) {
+            IconButton(
+              onClick = { onSpeakText(utterance.translatedText, utterance.targetLang) },
+              modifier = Modifier.size(36.dp).testTag("speak_translation_btn_${utterance.id}"),
+            ) {
+              Icon(
+                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                contentDescription = "朗讀翻譯結果",
+                tint = accentColor,
+                modifier = Modifier.size(20.dp),
+              )
+            }
+            IconButton(
+              onClick = { onOpenSpotlight(utterance) },
+              modifier = Modifier.size(36.dp).testTag("spotlight_btn_${utterance.id}"),
+            ) {
+              Icon(
+                imageVector = Icons.Default.Fullscreen,
+                contentDescription = "放大顯示給對方看",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+              )
+            }
           }
           IconButton(
             onClick = { onTogglePin(utterance) },
@@ -619,19 +648,46 @@ fun UtteranceBilingualCard(
 
       Spacer(modifier = Modifier.height(6.dp))
 
-      // Primary Translated Text (Large & Prominent for Immediate Comprehension)
-      Text(
-        text = utterance.translatedText,
-        style = MaterialTheme.typography.titleMedium,
-        fontWeight = FontWeight.Bold,
-        color = MaterialTheme.colorScheme.onSurface,
-      )
+      // Primary Translated Text (or Retry Action when Translation Failed)
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+      ) {
+        Text(
+          text = utterance.translatedText,
+          style = MaterialTheme.typography.titleMedium,
+          fontWeight = FontWeight.Bold,
+          color =
+            if (isFailed) {
+              MaterialTheme.colorScheme.error
+            } else {
+              MaterialTheme.colorScheme.onSurface
+            },
+          modifier = Modifier.weight(1f),
+        )
+        if (isFailed) {
+          Spacer(modifier = Modifier.width(8.dp))
+          OutlinedButton(
+            onClick = { onRetryTranslation(utterance) },
+            modifier = Modifier.testTag("retry_translation_btn_${utterance.id}"),
+          ) {
+            Icon(
+              imageVector = Icons.Default.Refresh,
+              contentDescription = "重試翻譯",
+              modifier = Modifier.size(16.dp),
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text("重試翻譯", style = MaterialTheme.typography.labelLarge)
+          }
+        }
+      }
 
       Spacer(modifier = Modifier.height(6.dp))
       HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f))
       Spacer(modifier = Modifier.height(6.dp))
 
-      // Original Text with replay button
+      // Original Text with replay button (Always preserved even if translation failed)
       Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,

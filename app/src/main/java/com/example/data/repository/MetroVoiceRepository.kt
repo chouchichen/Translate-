@@ -164,14 +164,31 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
     }
   }
 
+  /**
+   * Deletes all child documents in the `utterances` subcollection first so no orphaned
+   * transcripts remain in Firestore, and then deletes the parent `TestSession` document.
+   */
   suspend fun deleteSession(userId: String, sessionId: String) {
-    val docRef = db.collection("users").document(userId).collection("sessions").document(sessionId)
+    val sessionRef =
+      db.collection("users").document(userId).collection("sessions").document(sessionId)
+    val utterancesCollection = sessionRef.collection("utterances")
     try {
-      docRef.delete().await()
+      val utterancesSnapshot = utterancesCollection.get().await()
+      val docs = utterancesSnapshot.documents
+      if (docs.isNotEmpty()) {
+        for (chunk in docs.chunked(450)) {
+          val batch = db.batch()
+          for (doc in chunk) {
+            batch.delete(doc.reference)
+          }
+          batch.commit().await()
+        }
+      }
+      sessionRef.delete().await()
     } catch (e: CancellationException) {
       throw e
     } catch (e: Exception) {
-      handleFirestoreError(e, OperationType.DELETE, docRef.path)
+      handleFirestoreError(e, OperationType.DELETE, sessionRef.path)
       throw e
     }
   }
@@ -257,6 +274,42 @@ class MetroVoiceRepository(private val db: FirebaseFirestore) {
       throw e
     } catch (e: Exception) {
       handleFirestoreError(e, OperationType.CREATE, uttRef.path)
+      throw e
+    }
+  }
+
+  suspend fun updateUtteranceTranslation(
+    userId: String,
+    sessionId: String,
+    utteranceId: String,
+    translatedText: String,
+    technicalTerms: List<String>,
+  ) {
+    val uttRef =
+      db.collection("users")
+        .document(userId)
+        .collection("sessions")
+        .document(sessionId)
+        .collection("utterances")
+        .document(utteranceId)
+    val cleanTranslation =
+      translatedText.trim().take(2000).ifEmpty {
+        throw IllegalArgumentException("Translated text must not be blank")
+      }
+    try {
+      uttRef
+        .update(
+          mapOf(
+            "translatedText" to cleanTranslation,
+            "technicalTerms" to technicalTerms.take(15).map { it.take(200) },
+            "updatedAt" to FieldValue.serverTimestamp(),
+          )
+        )
+        .await()
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      handleFirestoreError(e, OperationType.UPDATE, uttRef.path)
       throw e
     }
   }

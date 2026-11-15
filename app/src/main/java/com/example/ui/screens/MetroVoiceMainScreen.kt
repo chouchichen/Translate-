@@ -75,7 +75,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -95,6 +94,7 @@ import com.example.data.model.TEST_VERDICTS
 import com.example.data.model.TestSession
 import com.example.data.model.Utterance
 import com.example.speech.ListeningChannel
+import com.example.speech.RecordingSessionContext
 import com.example.speech.VoiceBridgeManager
 import com.example.ui.components.CreateTestSessionDialog
 import com.example.ui.components.DualChannelControlDeck
@@ -119,7 +119,7 @@ fun MetroVoiceMainScreen(
 
   var activeTabIndex by remember { mutableIntStateOf(0) }
   var showCreateSessionDialog by remember { mutableStateOf(false) }
-  var pendingMicChannel by remember { mutableStateOf<ListeningChannel?>(null) }
+  var pendingMicRequest by remember { mutableStateOf<Pair<ListeningChannel, TestSession>?>(null) }
 
   BackHandler(enabled = activeTabIndex != 0) {
     activeTabIndex = 0
@@ -136,28 +136,26 @@ fun MetroVoiceMainScreen(
         ?: SUPPORTED_FOREIGN_LANGUAGES.first()
     }
 
-  val currentSessionUpdated by rememberUpdatedState(currentSession)
-
   val voiceBridge =
     remember(context) {
-      VoiceBridgeManager(
-        context = context,
-        onFinalSpeechResult = { channel, recognizedText ->
-          val session = currentSessionUpdated ?: return@VoiceBridgeManager
-          val role =
-            if (channel == ListeningChannel.FOREIGN_TO_LOCAL) {
-              "FOREIGN_ENGINEER"
-            } else {
-              "LOCAL_ENGINEER"
-            }
-          viewModel.translateAndRecordUtterance(
-            session = session,
-            speakerRole = role,
-            spokenText = recognizedText,
-            onSpeakTranslationReady = { _, _ -> },
-          )
-        },
-      )
+      lateinit var manager: VoiceBridgeManager
+      manager =
+        VoiceBridgeManager(
+          context = context,
+          onFinalSpeechResult = { recordingContext: RecordingSessionContext, recognizedText: String ->
+            // Uses the exact session and speaker direction pinned when recording started,
+            // AND invokes manager.speakText(...) when translation completes!
+            viewModel.translateAndRecordUtterance(
+              session = recordingContext.session,
+              speakerRole = recordingContext.speakerRole,
+              spokenText = recognizedText,
+              onSpeakTranslationReady = { spokenTranslation, langTag ->
+                manager.speakText(spokenTranslation, langTag)
+              },
+            )
+          },
+        )
+      manager
     }
 
   val voiceState by voiceBridge.state.collectAsStateWithLifecycle()
@@ -168,16 +166,11 @@ fun MetroVoiceMainScreen(
 
   val micPermissionLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
-      val targetChannel = pendingMicChannel
-      pendingMicChannel = null
-      if (isGranted && targetChannel != null && currentSession != null) {
-        val langTag =
-          if (targetChannel == ListeningChannel.FOREIGN_TO_LOCAL) {
-            currentSession.foreignLangCode
-          } else {
-            "zh-TW"
-          }
-        voiceBridge.startListening(targetChannel, langTag)
+      val request = pendingMicRequest
+      pendingMicRequest = null
+      if (isGranted && request != null) {
+        val (targetChannel, pinnedSession) = request
+        voiceBridge.startListening(targetChannel, pinnedSession)
       } else if (!isGranted) {
         Toast.makeText(
             context,
@@ -189,20 +182,14 @@ fun MetroVoiceMainScreen(
     }
 
   fun triggerVoiceChannel(channel: ListeningChannel) {
-    val session = currentSession ?: return
+    val sessionToPin = currentSession ?: return
     val hasMicPerm =
       ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
         PackageManager.PERMISSION_GRANTED
     if (hasMicPerm) {
-      val langTag =
-        if (channel == ListeningChannel.FOREIGN_TO_LOCAL) {
-          session.foreignLangCode
-        } else {
-          "zh-TW"
-        }
-      voiceBridge.startListening(channel, langTag)
+      voiceBridge.startListening(channel, sessionToPin)
     } else {
-      pendingMicChannel = channel
+      pendingMicRequest = channel to sessionToPin
       micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
     }
   }
@@ -359,7 +346,6 @@ fun MetroVoiceMainScreen(
           }
 
           isWideScreen && activeTabIndex != 2 -> {
-            // Canonical Split-Pane on Tablets / Foldables: Left = Live Dual Interpreter, Right = Live Meeting Minutes
             Row(
               modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
               horizontalArrangement = Arrangement.spacedBy(16.dp),
@@ -370,10 +356,12 @@ fun MetroVoiceMainScreen(
                   foreignLang = currentForeignLangOption,
                   utterances = utterances,
                   activeListeningChannel = voiceState.activeChannel,
+                  isFinalizingSpeech = voiceState.isFinalizingSpeech,
                   partialSpeechText = voiceState.partialTranscript,
                   aiTaskState = aiTaskState,
                   onStartVoiceChannel = { triggerVoiceChannel(it) },
-                  onStopVoiceChannel = { voiceBridge.stopListening() },
+                  onFinishVoiceChannel = { voiceBridge.finishListening() },
+                  onCancelVoiceChannel = { voiceBridge.cancelListening() },
                   onSubmitStatement = { role, text ->
                     viewModel.translateAndRecordUtterance(
                       session = currentSession,
@@ -387,6 +375,17 @@ fun MetroVoiceMainScreen(
                   onSpeakText = { text, lang -> voiceBridge.speakText(text, lang) },
                   onTogglePin = { viewModel.togglePinUtterance(it) },
                   onOpenSpotlight = { viewModel.showSpotlightCard(it) },
+                  onRetryTranslation = { utterance ->
+                    val targetSession =
+                      sessions.firstOrNull { it.id == utterance.sessionId } ?: currentSession
+                    viewModel.retryTranslateUtterance(
+                      session = targetSession,
+                      utterance = utterance,
+                      onSpeakTranslationReady = { spokenTranslation, langTag ->
+                        voiceBridge.speakText(spokenTranslation, langTag)
+                      },
+                    )
+                  },
                   onGenerateMinutesNow = {
                     viewModel.generateMeetingMinutes(
                       session = currentSession,
@@ -431,10 +430,12 @@ fun MetroVoiceMainScreen(
               foreignLang = currentForeignLangOption,
               utterances = utterances,
               activeListeningChannel = voiceState.activeChannel,
+              isFinalizingSpeech = voiceState.isFinalizingSpeech,
               partialSpeechText = voiceState.partialTranscript,
               aiTaskState = aiTaskState,
               onStartVoiceChannel = { triggerVoiceChannel(it) },
-              onStopVoiceChannel = { voiceBridge.stopListening() },
+              onFinishVoiceChannel = { voiceBridge.finishListening() },
+              onCancelVoiceChannel = { voiceBridge.cancelListening() },
               onSubmitStatement = { role, text ->
                 viewModel.translateAndRecordUtterance(
                   session = currentSession,
@@ -448,6 +449,17 @@ fun MetroVoiceMainScreen(
               onSpeakText = { text, lang -> voiceBridge.speakText(text, lang) },
               onTogglePin = { viewModel.togglePinUtterance(it) },
               onOpenSpotlight = { viewModel.showSpotlightCard(it) },
+              onRetryTranslation = { utterance ->
+                val targetSession =
+                  sessions.firstOrNull { it.id == utterance.sessionId } ?: currentSession
+                viewModel.retryTranslateUtterance(
+                  session = targetSession,
+                  utterance = utterance,
+                  onSpeakTranslationReady = { spokenTranslation, langTag ->
+                    voiceBridge.speakText(spokenTranslation, langTag)
+                  },
+                )
+              },
               onGenerateMinutesNow = {
                 viewModel.generateMeetingMinutes(
                   session = currentSession,
@@ -677,14 +689,17 @@ private fun LiveInterpreterPane(
   foreignLang: ForeignLanguageOption,
   utterances: List<Utterance>,
   activeListeningChannel: ListeningChannel,
+  isFinalizingSpeech: Boolean,
   partialSpeechText: String,
   aiTaskState: AiTaskState,
   onStartVoiceChannel: (ListeningChannel) -> Unit,
-  onStopVoiceChannel: () -> Unit,
+  onFinishVoiceChannel: () -> Unit,
+  onCancelVoiceChannel: () -> Unit,
   onSubmitStatement: (speakerRole: String, text: String) -> Unit,
   onSpeakText: (text: String, lang: String) -> Unit,
   onTogglePin: (Utterance) -> Unit,
   onOpenSpotlight: (Utterance) -> Unit,
+  onRetryTranslation: (Utterance) -> Unit,
   onGenerateMinutesNow: () -> Unit,
   modifier: Modifier = Modifier,
 ) {
@@ -700,11 +715,13 @@ private fun LiveInterpreterPane(
       DualChannelControlDeck(
         foreignLang = foreignLang,
         activeListeningChannel = activeListeningChannel,
+        isFinalizingSpeech = isFinalizingSpeech,
         partialSpeechText = partialSpeechText,
         isAiTranslating = isTranslating,
         translatingPreview = translatingPreview,
         onStartVoiceChannel = onStartVoiceChannel,
-        onStopVoiceChannel = onStopVoiceChannel,
+        onFinishVoiceChannel = onFinishVoiceChannel,
+        onCancelVoiceChannel = onCancelVoiceChannel,
         onSubmitStatement = onSubmitStatement,
       )
     }
@@ -772,6 +789,7 @@ private fun LiveInterpreterPane(
           onSpeakText = onSpeakText,
           onTogglePin = onTogglePin,
           onOpenSpotlight = onOpenSpotlight,
+          onRetryTranslation = onRetryTranslation,
         )
       }
     }
