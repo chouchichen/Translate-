@@ -569,6 +569,51 @@ class MetroVoiceRepository(
    * Guarantees that even if two devices somehow raced, only the device holding the active
    * [expectedAttemptId] can commit its translation.
    */
+  private fun buildHealedUtterancePayloadFromCache(
+    cached: DocumentSnapshot,
+    userId: String,
+    sessionId: String,
+    translatedText: String,
+    technicalTerms: List<String>,
+    translationAttemptId: String,
+  ): Map<String, Any> {
+    val role = cached.getString("speakerRole")
+    val validRole = if (role == "LOCAL_ENGINEER") "LOCAL_ENGINEER" else "FOREIGN_ENGINEER"
+    val label = cached.getString("speakerLabel")?.trim()?.take(100).orEmpty().ifEmpty { "Engineer" }
+    val sourceLang = cached.getString("sourceLang")?.trim()?.take(20).orEmpty().ifEmpty { "en-US" }
+    val targetLang = cached.getString("targetLang")?.trim()?.take(20).orEmpty().ifEmpty { "zh-TW" }
+    val originalText =
+      cached.getString("originalText")?.trim()?.take(2000).orEmpty().ifEmpty { "..." }
+    val isPinned = cached.getBoolean("isPinnedToMinutes") ?: false
+    val createdAt = cached.getTimestamp("createdAt") ?: FieldValue.serverTimestamp()
+    val payload =
+      mutableMapOf<String, Any>(
+        "userId" to userId,
+        "sessionId" to sessionId,
+        "speakerRole" to validRole,
+        "speakerLabel" to label,
+        "sourceLang" to sourceLang,
+        "targetLang" to targetLang,
+        "originalText" to originalText,
+        "translatedText" to translatedText.trim().take(2000).ifEmpty { "..." },
+        "technicalTerms" to technicalTerms.take(15).map { it.take(200) },
+        "isPinnedToMinutes" to isPinned,
+        "createdAt" to createdAt,
+        "updatedAt" to FieldValue.serverTimestamp(),
+      )
+    if (translationAttemptId.isNotBlank()) {
+      payload["translationAttemptId"] = translationAttemptId.trim().take(128)
+    }
+    return payload
+  }
+
+  /**
+   * Atomically writes the completed translation inside a Firestore transaction ONLY IF the
+   * document is still in the pending (`⏳`) state AND its `translationAttemptId` matches
+   * [expectedAttemptId].
+   * Guarantees that even if two devices somehow raced, only the device holding the active
+   * [expectedAttemptId] can commit its translation.
+   */
   suspend fun completeUtteranceTranslationIfAttemptMatches(
     userId: String,
     sessionId: String,
@@ -577,37 +622,62 @@ class MetroVoiceRepository(
     translatedText: String,
     technicalTerms: List<String>,
   ): Boolean {
-    val uttRef =
-      db.collection("users")
-        .document(userId)
-        .collection("sessions")
-        .document(sessionId)
-        .collection("utterances")
-        .document(utteranceId)
+    val sessionRef =
+      db.collection("users").document(userId).collection("sessions").document(sessionId)
+    val uttRef = sessionRef.collection("utterances").document(utteranceId)
     val cleanTranslation =
       translatedText.trim().take(2000).ifEmpty {
         throw IllegalArgumentException("Translated text must not be blank")
       }
+    val cachedSnapshot =
+      try {
+        uttRef.get(Source.CACHE).await()
+      } catch (_: Exception) {
+        null
+      }
     return try {
       db.runTransaction { transaction ->
           val snapshot = transaction.get(uttRef)
-          if (!snapshot.exists()) return@runTransaction false
-          val currentTranslated = snapshot.getString("translatedText").orEmpty()
-          val currentAttemptId = snapshot.getString("translationAttemptId").orEmpty()
+          val effectiveSnap =
+            if (snapshot.exists()) {
+              snapshot
+            } else if (cachedSnapshot != null && cachedSnapshot.exists()) {
+              val parentSnap = transaction.get(sessionRef)
+              if (!parentSnap.exists()) return@runTransaction false
+              cachedSnapshot
+            } else {
+              return@runTransaction false
+            }
+          val currentTranslated = effectiveSnap.getString("translatedText").orEmpty()
+          val currentAttemptId = effectiveSnap.getString("translationAttemptId").orEmpty()
           if (!currentTranslated.startsWith("⏳")) {
             return@runTransaction false
           }
           if (expectedAttemptId.isNotBlank() && currentAttemptId != expectedAttemptId) {
             return@runTransaction false
           }
-          transaction.update(
-            uttRef,
-            mapOf(
-              "translatedText" to cleanTranslation,
-              "technicalTerms" to technicalTerms.take(15).map { it.take(200) },
-              "updatedAt" to FieldValue.serverTimestamp(),
-            ),
-          )
+          if (snapshot.exists()) {
+            transaction.update(
+              uttRef,
+              mapOf(
+                "translatedText" to cleanTranslation,
+                "technicalTerms" to technicalTerms.take(15).map { it.take(200) },
+                "updatedAt" to FieldValue.serverTimestamp(),
+              ),
+            )
+          } else {
+            transaction.set(
+              uttRef,
+              buildHealedUtterancePayloadFromCache(
+                cached = effectiveSnap,
+                userId = userId,
+                sessionId = sessionId,
+                translatedText = cleanTranslation,
+                technicalTerms = technicalTerms,
+                translationAttemptId = expectedAttemptId.ifBlank { currentAttemptId },
+              ),
+            )
+          }
           true
         }
         .await()
@@ -633,20 +703,31 @@ class MetroVoiceRepository(
     failedText: String,
     expectedAttemptId: String? = null,
   ): Boolean {
-    val uttRef =
-      db.collection("users")
-        .document(userId)
-        .collection("sessions")
-        .document(sessionId)
-        .collection("utterances")
-        .document(utteranceId)
+    val sessionRef =
+      db.collection("users").document(userId).collection("sessions").document(sessionId)
+    val uttRef = sessionRef.collection("utterances").document(utteranceId)
     val cleanFailedText = failedText.trim().take(2000).ifEmpty { "⚠️ [翻譯失敗，請點擊重試]" }
+    val cachedSnapshot =
+      try {
+        uttRef.get(Source.CACHE).await()
+      } catch (_: Exception) {
+        null
+      }
     return try {
       db.runTransaction { transaction ->
           val snapshot = transaction.get(uttRef)
-          if (!snapshot.exists()) return@runTransaction false
-          val currentTranslated = snapshot.getString("translatedText").orEmpty()
-          val currentAttemptId = snapshot.getString("translationAttemptId").orEmpty()
+          val effectiveSnap =
+            if (snapshot.exists()) {
+              snapshot
+            } else if (cachedSnapshot != null && cachedSnapshot.exists()) {
+              val parentSnap = transaction.get(sessionRef)
+              if (!parentSnap.exists()) return@runTransaction false
+              cachedSnapshot
+            } else {
+              return@runTransaction false
+            }
+          val currentTranslated = effectiveSnap.getString("translatedText").orEmpty()
+          val currentAttemptId = effectiveSnap.getString("translationAttemptId").orEmpty()
           if (!currentTranslated.startsWith("⏳")) {
             // Another device already completed (or updated) this translation; do not overwrite!
             return@runTransaction false
@@ -655,14 +736,28 @@ class MetroVoiceRepository(
             // Another device already claimed a newer retry attempt; do not overwrite!
             return@runTransaction false
           }
-          transaction.update(
-            uttRef,
-            mapOf(
-              "translatedText" to cleanFailedText,
-              "technicalTerms" to emptyList<String>(),
-              "updatedAt" to FieldValue.serverTimestamp(),
-            ),
-          )
+          if (snapshot.exists()) {
+            transaction.update(
+              uttRef,
+              mapOf(
+                "translatedText" to cleanFailedText,
+                "technicalTerms" to emptyList<String>(),
+                "updatedAt" to FieldValue.serverTimestamp(),
+              ),
+            )
+          } else {
+            transaction.set(
+              uttRef,
+              buildHealedUtterancePayloadFromCache(
+                cached = effectiveSnap,
+                userId = userId,
+                sessionId = sessionId,
+                translatedText = cleanFailedText,
+                technicalTerms = emptyList(),
+                translationAttemptId = expectedAttemptId ?: currentAttemptId,
+              ),
+            )
+          }
           true
         }
         .await()
@@ -698,20 +793,31 @@ class MetroVoiceRepository(
     newAttemptId: String,
     pendingPlaceholder: String,
   ): Boolean {
-    val uttRef =
-      db.collection("users")
-        .document(userId)
-        .collection("sessions")
-        .document(sessionId)
-        .collection("utterances")
-        .document(utteranceId)
+    val sessionRef =
+      db.collection("users").document(userId).collection("sessions").document(sessionId)
+    val uttRef = sessionRef.collection("utterances").document(utteranceId)
+    val cachedSnapshot =
+      try {
+        uttRef.get(Source.CACHE).await()
+      } catch (_: Exception) {
+        null
+      }
     return try {
       db.runTransaction { transaction ->
           val snapshot = transaction.get(uttRef)
-          if (!snapshot.exists()) return@runTransaction false
-          val currentTranslated = snapshot.getString("translatedText").orEmpty()
-          val currentAttemptId = snapshot.getString("translationAttemptId").orEmpty()
-          val currentUpdatedAt = snapshot.getTimestamp("updatedAt")
+          val effectiveSnap =
+            if (snapshot.exists()) {
+              snapshot
+            } else if (cachedSnapshot != null && cachedSnapshot.exists()) {
+              val parentSnap = transaction.get(sessionRef)
+              if (!parentSnap.exists()) return@runTransaction false
+              cachedSnapshot
+            } else {
+              return@runTransaction false
+            }
+          val currentTranslated = effectiveSnap.getString("translatedText").orEmpty()
+          val currentAttemptId = effectiveSnap.getString("translationAttemptId").orEmpty()
+          val currentUpdatedAt = effectiveSnap.getTimestamp("updatedAt")
 
           if (!currentTranslated.startsWith("⚠️") && !currentTranslated.startsWith("⏳")) {
             // Translation already succeeded on another device; do not overwrite or re-translate!
@@ -740,14 +846,28 @@ class MetroVoiceRepository(
             }
           }
 
-          transaction.update(
-            uttRef,
-            mapOf(
-              "translatedText" to pendingPlaceholder,
-              "translationAttemptId" to newAttemptId.trim().take(128),
-              "updatedAt" to FieldValue.serverTimestamp(),
-            ),
-          )
+          if (snapshot.exists()) {
+            transaction.update(
+              uttRef,
+              mapOf(
+                "translatedText" to pendingPlaceholder,
+                "translationAttemptId" to newAttemptId.trim().take(128),
+                "updatedAt" to FieldValue.serverTimestamp(),
+              ),
+            )
+          } else {
+            transaction.set(
+              uttRef,
+              buildHealedUtterancePayloadFromCache(
+                cached = effectiveSnap,
+                userId = userId,
+                sessionId = sessionId,
+                translatedText = pendingPlaceholder,
+                technicalTerms = emptyList(),
+                translationAttemptId = newAttemptId.trim().take(128),
+              ),
+            )
+          }
           true
         }
         .await()

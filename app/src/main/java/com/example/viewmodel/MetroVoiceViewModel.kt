@@ -19,6 +19,8 @@ import java.util.UUID
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -28,6 +30,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
@@ -157,6 +160,17 @@ class MetroVoiceViewModel(
         )
     )
 
+  private val translationLiteModel by lazy {
+    Firebase.ai.generativeModel(
+      modelName = "gemini-3.5-flash-lite",
+      generationConfig =
+        generationConfig {
+          responseMimeType = "application/json"
+          responseSchema = translationSchema
+        },
+    )
+  }
+
   private val translationModel by lazy {
     Firebase.ai.generativeModel(
       modelName = "gemini-3.8-flash",
@@ -164,6 +178,17 @@ class MetroVoiceViewModel(
         generationConfig {
           responseMimeType = "application/json"
           responseSchema = translationSchema
+        },
+    )
+  }
+
+  private val minutesLiteModel by lazy {
+    Firebase.ai.generativeModel(
+      modelName = "gemini-3.5-flash-lite",
+      generationConfig =
+        generationConfig {
+          responseMimeType = "application/json"
+          responseSchema = minutesSchema
         },
     )
   }
@@ -274,18 +299,50 @@ class MetroVoiceViewModel(
                       (utt.id in interruptedOnThisDevice || utt.isStalePendingTranslation(nowMs))
                   if (shouldRecover && recoveringOrphanIds.add(utt.id)) {
                     viewModelScope.launch {
+                      var recovered = false
                       if (utt.id !in _activeTranslatingUtteranceIds.value) {
-                        markUtteranceTranslationFailed(
-                          sessionId = utt.sessionId,
-                          utteranceId = utt.id,
-                          reason = "上次口譯未完成，請點擊重試",
-                          expectedAttemptId = utt.translationAttemptId,
-                        )
+                        recovered =
+                          markUtteranceTranslationFailed(
+                            sessionId = utt.sessionId,
+                            utteranceId = utt.id,
+                            reason = "上次口譯未完成，請點擊重試",
+                            expectedAttemptId = utt.translationAttemptId,
+                          )
                       }
-                      if (utt.id !in _activeTranslatingUtteranceIds.value) {
+                      if (recovered && utt.id !in _activeTranslatingUtteranceIds.value) {
                         repository.clearInFlightTranslation(currentUserId, utt.id)
                         _localInterruptedUtteranceIds.value =
                           _localInterruptedUtteranceIds.value - utt.id
+                      }
+                    }
+                  } else if (
+                    utt.id.isNotBlank() &&
+                      utt.isTranslationPending() &&
+                      utt.id !in activeIds
+                  ) {
+                    val timerKey = "stale_timer_${utt.id}_${utt.translationAttemptId}"
+                    if (recoveringOrphanIds.add(timerKey)) {
+                      val timestampMs =
+                        (utt.updatedAt ?: utt.createdAt)?.toDate()?.time ?: nowMs
+                      val elapsedMs = (nowMs - timestampMs).coerceAtLeast(0L)
+                      val waitMs =
+                        (TRANSLATION_STALE_TIMEOUT_MS - elapsedMs).coerceAtLeast(1_000L) + 500L
+                      viewModelScope.launch {
+                        delay(waitMs)
+                        if (utt.id !in _activeTranslatingUtteranceIds.value) {
+                          val marked =
+                            markUtteranceTranslationFailed(
+                              sessionId = utt.sessionId,
+                              utteranceId = utt.id,
+                              reason = "口譯回應逾時，請點擊重試",
+                              expectedAttemptId = utt.translationAttemptId,
+                            )
+                          if (marked) {
+                            repository.clearInFlightTranslation(currentUserId, utt.id)
+                            _localInterruptedUtteranceIds.value =
+                              _localInterruptedUtteranceIds.value - utt.id
+                          }
+                        }
                       }
                     }
                   }
@@ -570,17 +627,47 @@ class MetroVoiceViewModel(
         """.trimIndent()
       }
 
-    val jsonString =
-      if (customTranslationGenerator != null) {
+    if (customTranslationGenerator != null) {
+      val jsonString =
         withTimeout(60_000L) {
           customTranslationGenerator.invoke(session, speakerRole, cleanInput)
         }
-      } else {
-        val response = withTimeout(60_000L) { translationModel.generateContent(directionPrompt) }
-        response.text ?: throw IllegalStateException("AI 模型回傳空白回應，請點擊重試翻譯。")
-      }
+      return parseAndValidateTranslationJson(jsonString)
+    }
 
-    return parseAndValidateTranslationJson(jsonString)
+    return withTimeout(60_000L) {
+      val attempts =
+        listOf(
+          Triple("gemini-3.5-flash-lite", translationLiteModel, 14_000L),
+          Triple("gemini-3.8-flash", translationModel, 18_000L),
+          Triple("gemini-3.5-flash-lite-retry", translationLiteModel, 22_000L),
+        )
+      var lastError: Exception? = null
+      for ((index, spec) in attempts.withIndex()) {
+        val (modelTag, modelInstance, attemptTimeoutMs) = spec
+        if (index == 2) {
+          delay(600L)
+        }
+        try {
+          val response =
+            withTimeout(attemptTimeoutMs) { modelInstance.generateContent(directionPrompt) }
+          val rawText =
+            response.text
+              ?: throw IllegalStateException("AI 模型回傳空白回應，請點擊重試翻譯。")
+          return@withTimeout parseAndValidateTranslationJson(rawText)
+        } catch (e: TimeoutCancellationException) {
+          if (!currentCoroutineContext().isActive) throw e
+          Log.w(TAG, "Translation attempt ($modelTag) timed out after ${attemptTimeoutMs}ms, failing over", e)
+          lastError = e
+        } catch (e: CancellationException) {
+          throw e
+        } catch (e: Exception) {
+          Log.w(TAG, "Translation attempt ($modelTag) failed, failing over", e)
+          lastError = e
+        }
+      }
+      throw (lastError ?: IllegalStateException("即時口譯暫時繁忙，請點擊重試翻譯。"))
+    }
   }
 
   /**
@@ -659,6 +746,7 @@ class MetroVoiceViewModel(
         }
 
       // Step 2: Run AI translation and commit only if our attemptId is still active
+      var shouldClearLocalInFlight = false
       try {
         val result = executeAiTranslation(session, speakerRole, cleanInput)
 
@@ -671,6 +759,7 @@ class MetroVoiceViewModel(
             translatedText = result.translatedText,
             technicalTerms = result.technicalTerms,
           )
+        shouldClearLocalInFlight = true
 
         if (committed) {
           // Dispatch speech strictly in spoken order via speechOrderQueue!
@@ -687,12 +776,13 @@ class MetroVoiceViewModel(
       } catch (e: TimeoutCancellationException) {
         markSpeechSlotFailedAndDrain(speechSlot)
         Log.e(TAG, "Translation timed out", e)
-        markUtteranceTranslationFailed(
-          sessionId = session.id,
-          utteranceId = savedUtteranceId,
-          reason = "連線逾時",
-          expectedAttemptId = attemptId,
-        )
+        shouldClearLocalInFlight =
+          markUtteranceTranslationFailed(
+            sessionId = session.id,
+            utteranceId = savedUtteranceId,
+            reason = "連線逾時",
+            expectedAttemptId = attemptId,
+          )
         _aiTaskState.value =
           AiTaskState.Error("即時口譯逾時（原文已保存至逐字稿，可直接點擊該句「重試翻譯」）。")
       } catch (e: CancellationException) {
@@ -701,20 +791,26 @@ class MetroVoiceViewModel(
       } catch (e: Exception) {
         markSpeechSlotFailedAndDrain(speechSlot)
         Log.e(TAG, "Firebase AI translation failed", e)
-        markUtteranceTranslationFailed(
-          sessionId = session.id,
-          utteranceId = savedUtteranceId,
-          reason = e.localizedMessage ?: "翻譯失敗",
-          expectedAttemptId = attemptId,
-        )
+        shouldClearLocalInFlight =
+          markUtteranceTranslationFailed(
+            sessionId = session.id,
+            utteranceId = savedUtteranceId,
+            reason = e.localizedMessage ?: "翻譯失敗",
+            expectedAttemptId = attemptId,
+          )
         _aiTaskState.value =
           AiTaskState.Error(
             "即時口譯失敗：${e.localizedMessage ?: "請稍後再試"}（原文已保存至逐字稿，可點擊「重試翻譯」）"
           )
       } finally {
-        repository.clearInFlightTranslation(currentUserId, savedUtteranceId)
-        _localInterruptedUtteranceIds.value =
-          _localInterruptedUtteranceIds.value - savedUtteranceId
+        if (shouldClearLocalInFlight) {
+          repository.clearInFlightTranslation(currentUserId, savedUtteranceId)
+          _localInterruptedUtteranceIds.value =
+            _localInterruptedUtteranceIds.value - savedUtteranceId
+        } else {
+          _localInterruptedUtteranceIds.value =
+            _localInterruptedUtteranceIds.value + savedUtteranceId
+        }
         _activeTranslatingUtteranceIds.value =
           _activeTranslatingUtteranceIds.value - savedUtteranceId
       }
@@ -776,6 +872,7 @@ class MetroVoiceViewModel(
     _aiTaskState.value = AiTaskState.Translating(utterance.speakerRole, utterance.originalText)
     viewModelScope.launch {
       repository.markInFlightTranslation(currentUserId, utterance.id)
+      var shouldClearLocalInFlight = false
       try {
         val claimed =
           repository.claimUtteranceForRetryIfEligible(
@@ -790,6 +887,7 @@ class MetroVoiceViewModel(
           )
         if (!claimed) {
           // Another device already claimed or completed this retry; do not translate or speak!
+          shouldClearLocalInFlight = true
           val remainingActive = _activeTranslatingUtteranceIds.value - utterance.id
           _activeTranslatingUtteranceIds.value = remainingActive
           if (remainingActive.isEmpty() && _aiTaskState.value is AiTaskState.Translating) {
@@ -814,6 +912,7 @@ class MetroVoiceViewModel(
             translatedText = result.translatedText,
             technicalTerms = result.technicalTerms,
           )
+        shouldClearLocalInFlight = true
 
         if (committed && _autoSpeakTranslation.value) {
           onSpeakTranslationReady(result.translatedText, pinnedTargetLang)
@@ -826,29 +925,36 @@ class MetroVoiceViewModel(
         }
       } catch (e: TimeoutCancellationException) {
         Log.e(TAG, "Retry translation timed out", e)
-        markUtteranceTranslationFailed(
-          sessionId = utterance.sessionId,
-          utteranceId = utterance.id,
-          reason = "連線逾時",
-          expectedAttemptId = newAttemptId,
-        )
+        shouldClearLocalInFlight =
+          markUtteranceTranslationFailed(
+            sessionId = utterance.sessionId,
+            utteranceId = utterance.id,
+            reason = "連線逾時",
+            expectedAttemptId = newAttemptId,
+          )
         _aiTaskState.value = AiTaskState.Error("重試口譯逾時，請檢查網路連線後再試一次。")
       } catch (e: CancellationException) {
         throw e
       } catch (e: Exception) {
         Log.e(TAG, "Retry translation failed", e)
-        markUtteranceTranslationFailed(
-          sessionId = utterance.sessionId,
-          utteranceId = utterance.id,
-          reason = e.localizedMessage ?: "翻譯失敗",
-          expectedAttemptId = newAttemptId,
-        )
+        shouldClearLocalInFlight =
+          markUtteranceTranslationFailed(
+            sessionId = utterance.sessionId,
+            utteranceId = utterance.id,
+            reason = e.localizedMessage ?: "翻譯失敗",
+            expectedAttemptId = newAttemptId,
+          )
         _aiTaskState.value =
           AiTaskState.Error("重試口譯失敗：${e.localizedMessage ?: "請稍後再試"}")
       } finally {
-        repository.clearInFlightTranslation(currentUserId, utterance.id)
-        _localInterruptedUtteranceIds.value =
-          _localInterruptedUtteranceIds.value - utterance.id
+        if (shouldClearLocalInFlight) {
+          repository.clearInFlightTranslation(currentUserId, utterance.id)
+          _localInterruptedUtteranceIds.value =
+            _localInterruptedUtteranceIds.value - utterance.id
+        } else {
+          _localInterruptedUtteranceIds.value =
+            _localInterruptedUtteranceIds.value + utterance.id
+        }
         _activeTranslatingUtteranceIds.value =
           _activeTranslatingUtteranceIds.value - utterance.id
       }
@@ -860,9 +966,9 @@ class MetroVoiceViewModel(
     utteranceId: String?,
     reason: String,
     expectedAttemptId: String? = null,
-  ) {
-    if (utteranceId.isNullOrBlank()) return
-    try {
+  ): Boolean {
+    if (utteranceId.isNullOrBlank()) return false
+    return try {
       repository.markUtteranceFailedIfStillPending(
         userId = currentUserId,
         sessionId = sessionId,
@@ -870,7 +976,9 @@ class MetroVoiceViewModel(
         failedText = "$FAILED_TRANSLATION_PREFIX（$reason）",
         expectedAttemptId = expectedAttemptId,
       )
-    } catch (_: Exception) {}
+    } catch (_: Exception) {
+      false
+    }
   }
 
   /**
@@ -928,9 +1036,38 @@ class MetroVoiceViewModel(
           4. "testVerdict": Choose the single most appropriate status from: "通過 (PASS)", "有條件通過 (CONDITIONAL)", "待複測 (PENDING RE-TEST)", "異常需追蹤 (ISSUE OPEN)", or "進行中 (In Progress)".
           """.trimIndent()
 
-        val response = withTimeout(60_000L) { minutesModel.generateContent(prompt) }
         val jsonString =
-          response.text ?: throw IllegalStateException("AI 模型回傳空白會議紀錄，請重試。")
+          withTimeout(60_000L) {
+            val attempts =
+              listOf(
+                Triple("gemini-3.5-flash-lite", minutesLiteModel, 20_000L),
+                Triple("gemini-3.8-flash", minutesModel, 25_000L),
+                Triple("gemini-3.5-flash-lite-retry", minutesLiteModel, 14_000L),
+              )
+            var lastError: Exception? = null
+            var resolvedText: String? = null
+            for ((idx, spec) in attempts.withIndex()) {
+              val (modelTag, modelInstance, attemptTimeoutMs) = spec
+              if (idx == 2) delay(600L)
+              try {
+                val response = withTimeout(attemptTimeoutMs) { modelInstance.generateContent(prompt) }
+                val text = response.text?.takeIf { it.isNotBlank() }
+                  ?: throw IllegalStateException("AI 模型回傳空白會議紀錄，請重試。")
+                resolvedText = text
+                break
+              } catch (e: TimeoutCancellationException) {
+                if (!currentCoroutineContext().isActive) throw e
+                Log.w(TAG, "Minutes attempt ($modelTag) timed out, failing over", e)
+                lastError = e
+              } catch (e: CancellationException) {
+                throw e
+              } catch (e: Exception) {
+                Log.w(TAG, "Minutes attempt ($modelTag) failed, failing over", e)
+                lastError = e
+              }
+            }
+            resolvedText ?: throw (lastError ?: IllegalStateException("AI 模型回傳空白會議紀錄，請重試。"))
+          }
 
         val json = JSONObject(jsonString)
         val summary = json.optString("summary", "").trim()
